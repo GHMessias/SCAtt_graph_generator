@@ -140,6 +140,54 @@ def distribution_transform(d: str, n: int, alpha: float = 2.0, seed=None,
     p = w / w.sum()
     return p
 
+
+def _to_int_list(values, name: str) -> list[int]:
+    """Convert common array-like inputs to a plain list of Python ints."""
+    if isinstance(values, torch.Tensor):
+        values = values.detach().cpu().view(-1).tolist()
+
+    try:
+        return [int(v) for v in values]
+    except TypeError as exc:
+        raise TypeError(f"{name} deve ser uma sequencia de inteiros.") from exc
+
+
+def _to_float_tensor(values, name: str) -> torch.Tensor:
+    tensor = torch.as_tensor(values, dtype=torch.float)
+    if torch.any(tensor < 0):
+        raise ValueError(f"{name} nao pode conter valores negativos.")
+    return tensor
+
+
+def _normalize_weights(weights: torch.Tensor) -> torch.Tensor:
+    weights = weights.float()
+    if weights.numel() == 0:
+        raise ValueError("Nao e possivel amostrar de uma distribuicao vazia.")
+    total = weights.sum()
+    if total <= 0:
+        return torch.ones_like(weights) / len(weights)
+    return weights / total
+
+
+def _sample_index(weights: torch.Tensor) -> int:
+    weights = _normalize_weights(weights)
+    return torch.multinomial(weights, num_samples=1).item()
+
+
+def _prepare_partition_matrix(matrix, num_partitions: int, label: int) -> torch.Tensor:
+    matrix = _to_float_tensor(matrix, f"C[{label}]")
+
+    if matrix.ndim == 1 and num_partitions == 1 and matrix.numel() == 1:
+        matrix = matrix.reshape(1, 1)
+
+    if matrix.ndim != 2 or tuple(matrix.shape) != (num_partitions, num_partitions):
+        raise ValueError(
+            f"C[{label}] deve ter shape ({num_partitions}, {num_partitions}); "
+            f"recebido {tuple(matrix.shape)}."
+        )
+
+    return matrix
+
 class graphPartition:
     """
     graphPartition recebe um subgrafo homogêneo (onde todos os vértices contém a mesma classe) e retorna a partição daquele subgrafo. A partição
@@ -217,6 +265,192 @@ class SCAttGenerator(BaseGenerator):
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
+    def _validate_generate_inputs(self, num_nodes, y, k, e, C, d, rho, N, M):
+        y = _to_int_list(y, "y")
+        e = _to_int_list(e, "e")
+
+        if num_nodes != sum(y):
+            raise ValueError(f"num_nodes deve ser igual a sum(y). num_nodes={num_nodes}, sum(y)={sum(y)}")
+        if k != len(y):
+            raise ValueError(f"k deve ser igual a len(y). k={k}, len(y)={len(y)}")
+        if len(e) != k:
+            raise ValueError(f"e deve ter tamanho k. len(e)={len(e)}, k={k}")
+        if len(d) != k:
+            raise ValueError(f"d deve ter tamanho k. len(d)={len(d)}, k={k}")
+        if len(M) != k:
+            raise ValueError(f"M deve ter tamanho k. len(M)={len(M)}, k={k}")
+        if len(C) != k:
+            raise ValueError(f"C deve ter tamanho k. len(C)={len(C)}, k={k}")
+        if rho < 0:
+            raise ValueError("rho deve ser maior ou igual a zero.")
+
+        M = [_to_float_tensor(m, f"M[{label}]").view(-1) for label, m in enumerate(M)]
+        for label, m in enumerate(M):
+            if m.numel() == 0 or m.sum() <= 0:
+                raise ValueError(f"M[{label}] deve conter pelo menos um peso positivo.")
+
+        C = [
+            _prepare_partition_matrix(C[label], num_partitions=len(M[label]), label=label)
+            for label in range(k)
+        ]
+
+        N = _to_float_tensor(N, "N")
+        if tuple(N.shape) != (k, k):
+            raise ValueError(f"N deve ter shape ({k}, {k}); recebido {tuple(N.shape)}.")
+        if not torch.all(torch.diagonal(N) == 0):
+            raise ValueError("A diagonal da matriz N deve ser zero.")
+
+        return y, e, C, N, M
+
+    def _sample_target_partition(self, C: torch.Tensor, src_partition: int) -> int:
+        row = C[src_partition].float()
+        if row.sum() <= 0:
+            return src_partition
+        return _sample_index(row)
+
+    def _connect_isolated_nodes(self, graph: nk.Graph, y: torch.Tensor):
+        isolated_nodes = [u for u in graph.iterNodes() if graph.degree(u) == 0]
+
+        for u in isolated_nodes:
+            all_nodes = torch.tensor(list(graph.iterNodes()), dtype=torch.long)
+            same_class = all_nodes[(y[all_nodes] == y[u]) & (all_nodes != u)]
+
+            if len(same_class) > 0:
+                degrees = torch.tensor([graph.degree(nd.item()) for nd in same_class]).float()
+                v = same_class[_sample_index(degrees)].item()
+            else:
+                fallback = all_nodes[all_nodes != u]
+                if len(fallback) == 0:
+                    continue
+                v = fallback[torch.randint(len(fallback), (1,))].item()
+
+            if not graph.hasEdge(u, v):
+                graph.addEdge(u, v)
+
+    def _estimate_interclass_matrix(self, graph: nk.Graph, y: torch.Tensor) -> torch.Tensor:
+        valid_labels = y[y >= 0]
+        if valid_labels.numel() == 0:
+            return torch.zeros((0, 0), dtype=torch.float)
+
+        matrix_size = int(valid_labels.max().item()) + 1
+        N = torch.zeros((matrix_size, matrix_size), dtype=torch.float)
+
+        for u, v in graph.iterEdges():
+            cu = int(y[u])
+            cv = int(y[v])
+            if cu >= 0 and cv >= 0 and cu != cv:
+                N[cu, cv] += 1
+                N[cv, cu] += 1
+
+        return N
+
+    def _subgraphs_by_label(self, attributed_graph: AttributedGraph) -> dict[int, nk.Graph]:
+        subgraphs = {}
+        for label in torch.unique(attributed_graph.y).tolist():
+            label = int(label)
+            if label < 0:
+                continue
+            nodes = torch.where(attributed_graph.y == label)[0].tolist()
+            subgraphs[label] = nk.graphtools.subgraphAndNeighborsFromNodes(attributed_graph.graph, nodes=nodes)
+        return subgraphs
+
+    def _add_heterogeneous_edges_until_density(
+        self,
+        graph: nk.Graph,
+        y: torch.Tensor,
+        target_density: float,
+        N: torch.Tensor,
+        max_attempts_factor: int = 200,
+    ):
+        actual_density = nk.graphtools.density(graph)
+        if actual_density >= target_density:
+            return
+
+        valid_nodes = [u for u in graph.iterNodes() if int(y[u]) >= 0]
+        labels = sorted({int(y[u]) for u in valid_nodes})
+        if len(labels) < 2:
+            return
+
+        class_nodes = {label: [u for u in valid_nodes if int(y[u]) == label] for label in labels}
+        matrix_size = max(max(labels) + 1, N.shape[0])
+        N_eff = torch.zeros((matrix_size, matrix_size), dtype=torch.float)
+        N_eff[: N.shape[0], : N.shape[1]] = N.float()
+        N_eff.fill_diagonal_(0)
+
+        if N_eff.sum() <= 0:
+            for src in labels:
+                for tgt in labels:
+                    if src != tgt:
+                        N_eff[src, tgt] = 1
+
+        attempts = 0
+        max_attempts = max(1, graph.upperEdgeIdBound() + graph.numberOfNodes()) * max_attempts_factor
+
+        while nk.graphtools.density(graph) < target_density:
+            attempts += 1
+            if attempts > max_attempts:
+                raise RuntimeError(
+                    "Nao foi possivel atingir rho com a matriz N informada. "
+                    "Verifique se ha pares de classes disponiveis para novas arestas heterogeneas."
+                )
+
+            source_weights = torch.zeros(matrix_size, dtype=torch.float)
+            for label in labels:
+                source_weights[label] = N_eff[label].sum()
+
+            community_u = _sample_index(source_weights)
+            target_weights = torch.zeros(matrix_size, dtype=torch.float)
+            for label in labels:
+                target_weights[label] = N_eff[community_u, label]
+
+            if target_weights.sum() <= 0:
+                continue
+
+            community_v = _sample_index(target_weights)
+            if community_u == community_v:
+                continue
+
+            u_candidates = class_nodes.get(community_u, [])
+            v_candidates = class_nodes.get(community_v, [])
+            if not u_candidates or not v_candidates:
+                continue
+
+            u = u_candidates[torch.randint(len(u_candidates), (1,)).item()]
+            v = v_candidates[torch.randint(len(v_candidates), (1,)).item()]
+
+            if u != v and not graph.hasEdge(u, v):
+                graph.addEdge(u, v)
+
+    def _generate_attributes(self, graph: nk.Graph, y: torch.Tensor, dimensions: int, sigma: float, alpha: float):
+        labels = sorted(int(label) for label in torch.unique(y[y >= 0]).tolist())
+        k = len(labels)
+        if dimensions < k:
+            raise ValueError(f"dimensions deve ser >= numero de classes. dimensions={dimensions}, classes={k}")
+
+        A = np.random.randn(dimensions, k)
+        Q, _ = np.linalg.qr(A)
+        prototypes = Q[:, :k].T
+        label_to_prototype = {label: idx for idx, label in enumerate(labels)}
+
+        x0 = np.zeros(shape=(graph.numberOfNodes(), dimensions))
+        for nd in range(graph.numberOfNodes()):
+            prototype_idx = label_to_prototype[int(y[nd])]
+            x0[nd] = prototypes[prototype_idx] + sigma * np.random.normal(size=(dimensions))
+
+        neighbor_sum = np.zeros_like(x0)
+        for u, v in graph.iterEdges():
+            neighbor_sum[u] += x0[v]
+            neighbor_sum[v] += x0[u]
+
+        degrees = np.array([graph.degree(nd) for nd in graph.iterNodes()], dtype=float)
+        degree_scale = np.zeros_like(degrees)
+        mask = degrees > 0
+        degree_scale[mask] = degrees[mask] ** (-0.5)
+
+        smoothed = degree_scale[:, None] * neighbor_sum
+        x = alpha * x0 + (1 - alpha) * smoothed
+        return torch.tensor(x)
+
     def rank_based_matching(self, base_graph: AttributedGraph, mimic_graph: nk.Graph, noise_mean: float = 0, noise_std: float = 1):
         x = torch.zeros((base_graph.graph.numberOfNodes(), base_graph.x.size(1)))
 
@@ -225,7 +459,7 @@ class SCAttGenerator(BaseGenerator):
             mask = base_graph.y == label
 
             # Filtrando os nós pelo label
-            nodes_with_label = torch.nonzero(mask).squeeze()  # Isso nos dá os índices dos nós com o rótulo desejado
+            nodes_with_label = torch.nonzero(mask).view(-1).tolist()
 
             # Calculando os graus apenas para os nós do label específico
             original_degrees = {node: base_graph.graph.degree(node) for node in nodes_with_label}
@@ -277,6 +511,7 @@ class SCAttGenerator(BaseGenerator):
         # Adding nodes 
         graph = nk.Graph(base_graph.graph.numberOfNodes(), weighted = False, directed = False)
         y = base_graph.y
+        interclass_matrix = self._estimate_interclass_matrix(base_graph.graph, y)
 
         for index, sub_g in base_graph.subgraphs.items():
             prt = graphPartition(subgraph=sub_g, base_community_detector=base_community_detector)
@@ -290,21 +525,21 @@ class SCAttGenerator(BaseGenerator):
 
             for _ in range(sub_g.numberOfEdges()):
                 # Escolho um vértice de acordo com sua node degree distribution
-                tmp_idx = torch.multinomial(weights, 1).item()
+                tmp_idx = _sample_index(weights)
                 u = keys[tmp_idx]
 
                 # Partição 
                 src_partition = prt._get_partition(u)
 
                 # Escolho em C algum vértice para ligar u
-                tgt_partition = torch.multinomial(input = prt.C[src_partition], num_samples=1)[0]
+                tgt_partition = self._sample_target_partition(prt.C, src_partition)
 
                 # Seleciono algum vértice v de acordo com a probabilidade de ligação dos vértices em tgt_partition
-                tmp_deg = {node:sub_g.degree(node) for node in prt.graph_partitions[tgt_partition.item()]}
+                tmp_deg = {node:sub_g.degree(node) for node in prt.graph_partitions[tgt_partition]}
                 tmp_keys = list(tmp_deg.keys())
                 tmp_weights = torch.tensor(list(tmp_deg.values()), dtype=torch.float)
 
-                tmp_idx = torch.multinomial(tmp_weights, 1).item()
+                tmp_idx = _sample_index(tmp_weights)
                 v = tmp_keys[tmp_idx]
 
                 if u != v:
@@ -314,72 +549,15 @@ class SCAttGenerator(BaseGenerator):
 
         aim_density = nk.graphtools.density(base_graph.graph)
 
-        actual_density = nk.graphtools.density(graph)
-        tmp_weights = torch.ones(graph.numberOfNodes())
-
-        # print(actual_density ,'/', aim_density)
-
-        # TODO: verificar se essa adição aleatória de densidade faz sentido para a criação do algoritmo
-        while actual_density < aim_density:
-            # print(actual_density ,'/', aim_density, end = '\r')
-            # Adiciona arestas aleatorias no grafo
-            u = tmp_weights.multinomial(num_samples=1, replacement=False)
-            v = tmp_weights.multinomial(num_samples=1, replacement=False)
-
-            if y[u] == y[v]:
-                continue
-            else:
-                if not graph.hasEdge(u,v):
-                    graph.addEdge(u,v)
-            
-            actual_density = nk.graphtools.density(graph)
+        self._add_heterogeneous_edges_until_density(
+            graph=graph,
+            y=y,
+            target_density=aim_density,
+            N=interclass_matrix,
+        )
 
 
-        isolated_nodes = [u for u in graph.iterNodes() if graph.degree(u) == 0]
-
-        # Add isolated nodes in nodes of the same class, according to degree probability
-
-        # for u in isolated_nodes:
-        #     selected_candidates = torch.tensor(list(graph.iterNodes()))[y == y[u]]
-        #     degrees = torch.tensor([graph.degree(nd) for nd in selected_candidates]).type(torch.float)
-        #     v = torch.multinomial(degrees, num_samples = 1, replacement=False)[0].item()
-
-        #     added_var = True
-
-        #     max_iter = 0
-        #     while added_var:
-        #         # print(u,v)
-                
-        #         if u != v:
-        #             graph.addEdge(u,v)
-        #             added_var = False
-        #             max_iter += 1
-        #             if max_iter > 100:
-        #                 break
-
-        for u in isolated_nodes:
-
-            all_nodes = torch.tensor(list(graph.iterNodes()))
-
-            # candidatos da mesma classe exceto u
-            same_class = all_nodes[(y == y[u]) & (all_nodes != u)]
-
-            if len(same_class) > 0:
-                degrees = torch.tensor([graph.degree(nd.item()) for nd in same_class]).float()
-
-                if degrees.sum() > 0:
-                    probs = degrees / degrees.sum()
-                    v = same_class[torch.multinomial(probs, 1)].item()
-                else:
-                    # todos têm grau zero → escolha uniforme
-                    v = same_class[torch.randint(len(same_class), (1,))].item()
-
-            else:
-                # fallback: qualquer nó diferente de u
-                fallback = all_nodes[all_nodes != u]
-                v = fallback[torch.randint(len(fallback), (1,))].item()
-
-            graph.addEdge(u, v)
+        self._connect_isolated_nodes(graph, y)
 
         # Feature generation stage (Cluster-Conditional Sampling)
         # For every node x_v in class y_i
@@ -399,14 +577,19 @@ class SCAttGenerator(BaseGenerator):
             nodes_to_add = num_nodes - base_graph.graph.numberOfNodes()
 
             # Gerando novas partições para o grafo clonado
-            _global_partitions = {index:graphPartition(subgraph, base_community_detector) for index,subgraph in attGraph.subgraphs.items()}
+            _global_partitions = {
+                label: graphPartition(subgraph, base_community_detector)
+                for label, subgraph in self._subgraphs_by_label(attGraph).items()
+            }
             
             for _ in range(nodes_to_add):
                 # added node
                 v_i = attGraph.graph.addNode()
 
                 # class of the added node
-                c_i = torch.multinomial(torch.unique(attGraph.y, return_counts = True)[1].float(), num_samples=1)[0].item()
+                class_values, class_counts = torch.unique(attGraph.y, return_counts=True)
+                sampled_class_index = _sample_index(class_counts.float())
+                c_i = int(class_values[sampled_class_index].item())
 
                 # adding the selected class to y
                 attGraph.y = torch.cat((attGraph.y, torch.tensor([c_i])))
@@ -435,12 +618,15 @@ class SCAttGenerator(BaseGenerator):
                     if torch.sum(row) == 0:
                         tgt_partition = src_partition
                     else:
-                        tgt_partition = torch.multinomial(row, 1)[0].item()
+                        tgt_partition = _sample_index(row)
 
                     continue_add = True
                     while continue_add:
                         # Seleciona o vértice a ser ligado a partir do degree
-                        v_j = torch.multinomial(torch.tensor([attGraph.graph.degree(nd) for nd in _global_partitions[c_i].graph_partitions[tgt_partition]]).type(torch.float), num_samples=1, replacement=False)[0].item()
+                        candidate_degrees = torch.tensor(
+                            [attGraph.graph.degree(nd) for nd in _global_partitions[c_i].graph_partitions[tgt_partition]]
+                        ).float()
+                        v_j = _sample_index(candidate_degrees)
                         v_j = _global_partitions[c_i].graph_partitions[tgt_partition][v_j]
                         if v_i != v_j:
                             graph.addEdge(v_i,v_j)
@@ -449,26 +635,12 @@ class SCAttGenerator(BaseGenerator):
                             continue_add = False
 
             # Adicionar Ruído
-            actual_density = nk.graphtools.density(attGraph.graph)
-            aim_density = nk.graphtools.density(base_graph.graph)
-            tmp_weights = torch.ones(attGraph.graph.numberOfNodes())
-
-            # print(actual_density ,'/', aim_density)
-            while actual_density < aim_density:
-                # print(round(actual_density,4) ,'/', round(aim_density,4))
-                # Adiciona arestas aleatorias no grafo
-                u = tmp_weights.multinomial(num_samples=1, replacement=False).item()
-                v = tmp_weights.multinomial(num_samples=1, replacement=False).item()
-
-                # print(u,v)
-
-                if attGraph.y[u] == attGraph.y[v]:
-                    continue
-                else:
-                    if not attGraph.graph.hasEdge(u,v):
-                        attGraph.graph.addEdge(u,v)
-                
-                actual_density = nk.graphtools.density(attGraph.graph)
+            self._add_heterogeneous_edges_until_density(
+                graph=attGraph.graph,
+                y=attGraph.y,
+                target_density=nk.graphtools.density(base_graph.graph),
+                N=interclass_matrix,
+            )
 
         # REMOVE IF THERE WAS AN ERROR
         attGraph.create_subgraphs()
@@ -497,56 +669,96 @@ class SCAttGenerator(BaseGenerator):
         :type: list[torch.tensor]
         '''
 
-        # TODO: colocar um iterador máximo pra não dar erro quando não consegue sortear os vértices corretos.
-        is_zero_diag = torch.all(torch.diagonal(N) == 0)
-        if not is_zero_diag:
-            raise ValueError('Matrix N diagonal should be zero')
+        y, e, C, N, M = self._validate_generate_inputs(
+            num_nodes=num_nodes,
+            y=y,
+            k=k,
+            e=e,
+            C=C,
+            d=d,
+            rho=rho,
+            N=N,
+            M=M,
+        )
 
         tmp_graph = nk.Graph(num_nodes, weighted = False, directed = False)
-        tmp_y = torch.tensor([i for i, v in enumerate(y) for _ in range(v)])
+        tmp_y = torch.tensor([i for i, v in enumerate(y) for _ in range(v)], dtype=torch.long)
 
         # Atribuir cada um dos vértices de cada grupo a cada partição
 
-        # out = split_by_class_and_partitions(n = num_nodes, y = y, parts=M.detach().cpu().flatten().tolist())
         out = split_by_class_and_partitions(n = num_nodes, y = y, parts=[x.tolist() for x in M])
         for label, label_num_nodes in enumerate(y):
-            # distribution = distribution_transform(d = d[label], n = label_num_nodes)
-            distributions = [distribution_transform(d = d[label], n = len(out[label][ptt]), alpha=alpha_powerlaw, mu = mu_distribution, sigma=sigma_distribution) for ptt in range(len(M[label]))]
+            max_edges = label_num_nodes * (label_num_nodes - 1) // 2
+            if e[label] > max_edges:
+                raise ValueError(
+                    f"e[{label}]={e[label]} excede o maximo de arestas simples na classe "
+                    f"com {label_num_nodes} nos ({max_edges})."
+                )
+
+            distributions = []
+            partition_sizes = torch.tensor([len(partition) for partition in out[label]], dtype=torch.float)
+            for ptt in range(len(M[label])):
+                if len(out[label][ptt]) == 0:
+                    distributions.append(torch.empty(0))
+                    continue
+                distributions.append(
+                    distribution_transform(
+                        d=d[label],
+                        n=len(out[label][ptt]),
+                        alpha=alpha_powerlaw,
+                        mu=mu_distribution,
+                        sigma=sigma_distribution,
+                        eps=eps,
+                    )
+                )
 
             added_edges = 0
-            tmp_count = 0
+            attempts = 0
+            max_attempts = max(1_000, e[label] * 200)
+            src_partition_weights = M[label].float().clone()
+            src_partition_weights[partition_sizes == 0] = 0
+
+            if src_partition_weights.sum() <= 0 and e[label] > 0:
+                raise ValueError(f"A classe {label} nao possui subcomunidades com nos.")
 
             while added_edges < e[label]:
-                # seleciona src_partition e tgt_partition
-                src_partition = torch.multinomial(M[label].float(), 1).item()
-                tgt_partition = torch.multinomial(M[label].float(), 1).item()
+                attempts += 1
+                if attempts > max_attempts:
+                    raise RuntimeError(
+                        f"Nao foi possivel criar e[{label}]={e[label]} arestas na classe {label}. "
+                        "Verifique C, M e o numero de nos por subcomunidade."
+                    )
 
+                src_partition = _sample_index(src_partition_weights)
+                target_weights = C[label][src_partition].float().clone()
+                target_weights[partition_sizes == 0] = 0
 
-                # row = C[label][src_partition].float()
+                if target_weights.sum() <= 0:
+                    target_weights = src_partition_weights.clone()
 
-                # if row.sum() == 0:
-                #     tgt_partition = src_partition
-                # else:
-                #     tgt_partition = torch.multinomial(row, 1).item()
+                tgt_partition = _sample_index(target_weights)
 
                 # seleciona u e v em src_partition
-                u_index = torch.multinomial(input = distributions[src_partition], num_samples=1).item()
-                v_index = torch.multinomial(input = distributions[tgt_partition], num_samples=1).item()
+                u_index = _sample_index(distributions[src_partition])
+                v_index = _sample_index(distributions[tgt_partition])
                 u = out[label][src_partition][u_index]
                 v = out[label][tgt_partition][v_index]
 
                 # verificar se u é igual a v
                 while u == v:
-                    u_index = torch.multinomial(input = distributions[src_partition], num_samples=1).item()
-                    v_index = torch.multinomial(input = distributions[tgt_partition], num_samples=1).item()
+                    if len(out[label][src_partition]) == 1 and src_partition == tgt_partition:
+                        break
+                    u_index = _sample_index(distributions[src_partition])
+                    v_index = _sample_index(distributions[tgt_partition])
                     u = out[label][src_partition][u_index]
                     v = out[label][tgt_partition][v_index]
+
+                if u == v:
+                    continue
 
                 if not tmp_graph.hasEdge(u,v):
                     tmp_graph.addEdge(u,v)
                     added_edges += 1
-                else:
-                    tmp_count += 1
 
         # removing isolated nodes
         isolated_nodes = [u for u in tmp_graph.iterNodes() if tmp_graph.degree(u) == 0]
@@ -564,37 +776,12 @@ class SCAttGenerator(BaseGenerator):
 
         # print(f'tamanho do y {tmp_y.shape}, numero de vértices {tmp_graph.numberOfNodes()}')
 
-        # noise stage
-
-        actual_node_density = nk.graphtools.density(tmp_graph)
-
-        # TODO: Verificar a adição de arestas heterogêneas
-        while actual_node_density < rho:
-            
-            # adiciona uma aresta aleatoria entre as classes que estão disponíveis em N
-            # p = N.flatten()
-            # p = p / p.sum()
-            p = N.sum(dim = 1)
-            # print(p)
-
-            # amostra um índice linear
-            community_u = torch.multinomial(p, num_samples=1).item()
-            community_v = torch.multinomial(N[community_u], num_samples=1).item()
-            # print(community_u, community_v)
-
-            idx1 = torch.nonzero(tmp_y == community_u, as_tuple=False).squeeze()
-            idx2 = torch.nonzero(tmp_y == community_v, as_tuple=False).squeeze()
-            # print(idx1, idx2)
-
-            u = idx1[torch.randint(len(idx1), (1,))].item()
-            v = idx2[torch.randint(len(idx2), (1,))].item()
-            # print(u,v, tmp_graph.hasEdge(u,v))
-
-            # print(community_u, u,community_v,v)
-            
-            tmp_graph.addEdge(u,v)
-
-            actual_node_density = nk.graphtools.density(tmp_graph)
+        self._add_heterogeneous_edges_until_density(
+            graph=tmp_graph,
+            y=tmp_y,
+            target_density=rho,
+            N=N,
+        )
 
         # TESTE REMOVENDO OS VÉRTICES E REINDEXANDO
         tmp_graph = compact_graph_ids(tmp_graph)
@@ -603,33 +790,15 @@ class SCAttGenerator(BaseGenerator):
         mask[tmp_y == -1] = False
         tmp_y = tmp_y[mask]
 
-        A = np.random.randn(dimensions,k)
-        Q, _ = np.linalg.qr(A)
-        Q = Q[:,:k].T
+        x = self._generate_attributes(
+            graph=tmp_graph,
+            y=tmp_y,
+            dimensions=dimensions,
+            sigma=sigma,
+            alpha=alpha,
+        )
 
-        # print('vetores ortogonais', Q)
-
-        x = np.zeros(shape = (tmp_graph.numberOfNodes(), dimensions))
-
-        for nd in range(tmp_graph.numberOfNodes()):
-            x[nd] = Q[tmp_y[nd]] + sigma * np.random.normal(size = (dimensions))
-
-        dd = nk.centrality.DegreeCentrality(tmp_graph, normalized=False)
-        dd.run()
-        degrees = np.array(dd.scores(), dtype=float)
-
-        D = np.zeros_like(degrees)
-
-        mask = degrees > 0
-        D[mask] = degrees[mask] ** (-0.5)
-
-        D = np.diag(D)
-
-        A = nk.algebraic.adjacencyMatrix(tmp_graph, matrixType="dense")
-
-        x = (alpha) * x + (1-alpha) * D @ (A @ x)
-
-        return  AttributedGraph(graph = tmp_graph, y = tmp_y, x = torch.tensor(x))
+        return  AttributedGraph(graph = tmp_graph, y = tmp_y, x = x)
 
     def generate(self, num_nodes: int, y: list[int], k: int, e: list[int], C: list[torch.tensor], d: list[str], rho: float, N: torch.tensor, M: list[torch.tensor], sigma = 1, dimensions = 10, alpha = 0.8, alpha_powerlaw = 2, sigma_distribution = None, mu_distribution = None, eps = 1e-6):
         return self._run_scatt(num_nodes=num_nodes, y=y, k=k, e=e, C=C, d=d, rho=rho, N=N, M=M, sigma=sigma, dimensions = dimensions, alpha = alpha, alpha_powerlaw=alpha_powerlaw, sigma_distribution=sigma_distribution, mu_distribution=mu_distribution, eps = eps)
@@ -818,7 +987,11 @@ class SCAttGenerator(BaseGenerator):
         # 4) Mimicar/clonar SOMENTE o grafo de treino
         # ---------------------------------------------------------
 
-        final_num_nodes = int(mimic_num_nodes * train_graph.graph.numberOfNodes())
+        final_num_nodes = (
+            int(mimic_num_nodes * train_graph.graph.numberOfNodes())
+            if mimic_num_nodes is not None
+            else None
+        )
         mimic_graph = self.mimic(
             base_graph=train_graph,
             num_nodes=final_num_nodes,

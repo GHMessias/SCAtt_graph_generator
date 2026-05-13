@@ -66,7 +66,8 @@ class BaseGenerator(ABC):
         filtered = {k: v for k,v in config.items() if k in allowed_keys}
         return cls(**filtered)
     
-    def fom_json(cls, source):
+    @classmethod
+    def from_json(cls, source):
         if isinstance(source, (str, Path)):
             with open(source, "r") as f:
                 config = json.load(f)
@@ -80,6 +81,10 @@ class BaseGenerator(ABC):
             config = config["params"]
 
         return cls.from_config(config)
+
+    @classmethod
+    def fom_json(cls, source):
+        return cls.from_json(source)
 
     def to_config(self) -> dict:
         # Pega os atributos públicos do objeto (ou um subconjunto que você definir)

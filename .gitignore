@@ -3,3 +3,5 @@ DGCluster/
 datasets/
 experiments/results/topologic
 experiments/results/sfanalysis
+__pycache__/
+*.pyc
