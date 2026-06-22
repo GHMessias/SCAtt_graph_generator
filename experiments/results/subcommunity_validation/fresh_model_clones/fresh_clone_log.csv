@@ -1,0 +1,4 @@
+model,status,seconds,nodes,edges,path
+SCAtt_fresh,ok,1.038792371749878,2708,5089,/home/gui-messias/Desktop/pip_synthetic_graphgen/synthetic_graphgen/experiments/results/subcommunity_validation/fresh_model_clones/SCAtt_fresh.pt
+GenCAT_fresh,ok,7.0886101722717285,2708,5998,/home/gui-messias/Desktop/pip_synthetic_graphgen/synthetic_graphgen/experiments/results/subcommunity_validation/fresh_model_clones/GenCAT_fresh.pt
+Chung-Lu_fresh,ok,0.1100306510925293,2708,5278,/home/gui-messias/Desktop/pip_synthetic_graphgen/synthetic_graphgen/experiments/results/subcommunity_validation/fresh_model_clones/Chung-Lu_fresh.pt
