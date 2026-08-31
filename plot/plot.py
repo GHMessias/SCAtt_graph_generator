@@ -1,1035 +1,637 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple, Union, Iterable, Any
-import math
+from pathlib import Path
+from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
 
-import igraph as ig
+import matplotlib.pyplot as plt
 import networkit as nk
 import networkx as nx
-import matplotlib.pyplot as plt
-from matplotlib.patches import Ellipse
+import numpy as np
+import torch
 from matplotlib.lines import Line2D
+
+try:
+    from netgraph import Graph
+except ImportError as exc:
+    Graph = None
+    _NETGRAPH_IMPORT_ERROR = exc
+else:
+    _NETGRAPH_IMPORT_ERROR = None
 
 from core.attributed_graph import AttributedGraph
 
-import torch
-import numpy as np
-import pandas as pd
-
-
-def nk_to_igraph_remap(g_nk: nk.Graph) -> Tuple[ig.Graph, Dict[int, int], Dict[int, int]]:
-    nodes = list(g_nk.iterNodes())
-    old_to_new = {old: new for new, old in enumerate(nodes)}
-    new_to_old = {new: old for old, new in old_to_new.items()}
-
-    g_ig = ig.Graph(n=len(nodes), directed=g_nk.isDirected())
-    edges = [(old_to_new[u], old_to_new[v]) for u, v in g_nk.iterEdges()]
-    g_ig.add_edges(edges)
-    return g_ig, old_to_new, new_to_old
-
-
-def nk_to_networkx(g_nk: nk.Graph) -> nx.Graph:
-    g_nx = nx.Graph()
-    g_nx.add_nodes_from(g_nk.iterNodes())
-    g_nx.add_edges_from(g_nk.iterEdges())
-    return g_nx
-
 
 @dataclass
-class PlotStyle:
-    layout: Union[str, ig.Layout] = "fr"
+class PublicationPlotStyle:
+    """Defaults chosen for clean, publication-oriented graph figures."""
+
+    figsize: Tuple[float, float] = (6.4, 5.6)
     dpi: int = 300
-    bbox: Tuple[int, int] = (900, 900)
-    margin: int = 35
-    edge_width: float = 0.6
+    seed: int = 2026
+    node_layout: str = "community"
+    edge_layout: str = "bundled"
+    edge_bundle_k: int = 2000
+    community_distance: float = 1.0
+    node_layout_pad_by: float = 0.05
+    node_size: Optional[float] = None
+    node_edge_width: float = 0.0
+    edge_width: float = 0.45
+    edge_alpha: float = 0.14
+    class_edge_alpha: Optional[float] = None
+    interclass_edge_alpha: Optional[float] = None
+    font_size: float = 9.0
+    title_size: float = 11.0
+    show_legend: bool = True
+    legend_title: str = "Class"
+    background: str = "white"
+    edge_color: str = "#9AA1A9"
+    color_intraclass_edges: bool = True
+    interclass_edge_color: str = "#000000"
+    node_edge_color: str = "white"
+    palette: Sequence[str] = field(
+        default_factory=lambda: (
+            "#0072B2",
+            "#D55E00",
+            "#009E73",
+            "#CC79A7",
+            "#E69F00",
+            "#56B4E9",
+            "#F0E442",
+            "#6F4E7C",
+            "#4D4D4D",
+        )
+    )
 
-    vertex_size_range: Tuple[float, float] = (6.0, 28.0)
-    degree_size_sqrt: bool = True
 
-    default_vertex_color: str = "#4C78A8"
-    subgraph_colors: Sequence[str] = field(default_factory=lambda: [
-        "#4C78A8", "#F58518", "#54A24B", "#E45756",
-        "#72B7B2", "#B279A2", "#FF9DA6", "#9D755D", "#BAB0AC"
-    ])
+def _as_label_array(y: Optional[torch.Tensor]) -> Optional[np.ndarray]:
+    if y is None:
+        return None
+    if isinstance(y, torch.Tensor):
+        return y.detach().cpu().numpy()
+    return np.asarray(y)
 
-    show_labels: bool = False
-    label_size: float = 9.0
 
-    add_titles: bool = True
-    title_prefix: str = "Subgrafo"
-    figsize: Optional[Tuple[float, float]] = None
+def _networkit_to_networkx(
+    g: nk.Graph,
+    nodes: Optional[Iterable[int]] = None,
+) -> nx.Graph:
+    selected = None if nodes is None else {int(node) for node in nodes}
+    graph_cls = nx.DiGraph if g.isDirected() else nx.Graph
+    graph_nx = graph_cls()
+
+    for node in g.iterNodes():
+        node = int(node)
+        if selected is None or node in selected:
+            graph_nx.add_node(node)
+
+    for u, v in g.iterEdges():
+        u = int(u)
+        v = int(v)
+        if u in graph_nx and v in graph_nx:
+            graph_nx.add_edge(u, v)
+
+    return graph_nx
 
 
 class graphPlotter:
-    def __init__(self, style: Optional[PlotStyle] = None):
-        self.style = style or PlotStyle()
+    def __init__(self, style: Optional[PublicationPlotStyle] = None):
+        self.style = style or PublicationPlotStyle()
 
-    # -------- helpers --------
-    def _resolve_layout(self, g_ig: ig.Graph, layout: Optional[Union[str, ig.Layout]] = None) -> ig.Layout:
-        lay_spec = layout if layout is not None else self.style.layout
-        if isinstance(lay_spec, ig.Layout):
-            return lay_spec
-        return g_ig.layout(lay_spec)
+    def _class_nodes(self, graph: AttributedGraph, class_id: int) -> list[int]:
+        labels = _as_label_array(graph.y)
+        if labels is None:
+            raise ValueError("Para plotar uma classe especifica, o grafo precisa ter labels em graph.y.")
+        return [int(node) for node in graph.graph.iterNodes() if int(labels[int(node)]) == int(class_id)]
 
-    def _sizes_from_degree(self, g_ig: ig.Graph, size_range: Optional[Tuple[float, float]] = None) -> List[float]:
-        vmin, vmax = size_range if size_range is not None else self.style.vertex_size_range
-        deg = g_ig.degree()
-        if len(deg) == 0:
-            return []
-        dmin, dmax = min(deg), max(deg)
-        if dmin == dmax:
-            return [0.5 * (vmin + vmax)] * g_ig.vcount()
+    def _class_colors(self, labels: Optional[np.ndarray]) -> Dict[int, str]:
+        if labels is None:
+            return {}
 
-        sizes: List[float] = []
-        for d in deg:
-            t = (d - dmin) / (dmax - dmin)
-            if self.style.degree_size_sqrt:
-                t = math.sqrt(t)
-            sizes.append(vmin + t * (vmax - vmin))
-        return sizes
+        class_values = [int(value) for value in sorted(np.unique(labels[labels >= 0]))]
+        return {
+            class_value: self.style.palette[idx % len(self.style.palette)]
+            for idx, class_value in enumerate(class_values)
+        }
 
-    def _labels_from_mapping(
+    def _node_to_community(self, graph_nx: nx.Graph, labels: Optional[np.ndarray]) -> Dict[int, int]:
+        if labels is None:
+            return {int(node): 0 for node in graph_nx.nodes}
+        return {int(node): int(labels[int(node)]) for node in graph_nx.nodes}
+
+    def _node_colors(
         self,
-        g_ig: ig.Graph,
-        new_to_old: Dict[int, int],
-        show_labels: Optional[bool] = None,
-    ) -> Optional[List[str]]:
-        show = self.style.show_labels if show_labels is None else show_labels
-        if not show:
-            return None
-        return [str(new_to_old[v.index]) for v in g_ig.vs]
+        graph_nx: nx.Graph,
+        labels: Optional[np.ndarray],
+        color_map: Dict[int, str],
+        class_id: Optional[int],
+    ) -> Dict[int, str]:
+        if labels is None:
+            return {int(node): self.style.palette[0] for node in graph_nx.nodes}
 
-    def _colors_from_labels(
+        colors = {}
+        for node in graph_nx.nodes:
+            label = int(class_id) if class_id is not None else int(labels[int(node)])
+            colors[int(node)] = color_map.get(label, "#8A8F98")
+        return colors
+
+    def _edge_colors(
         self,
-        attGraph: AttributedGraph,
-        g_ig: ig.Graph,
-        new_to_old: Dict[int, int],
+        graph_nx: nx.Graph,
+        labels: Optional[np.ndarray],
+        color_map: Dict[int, str],
         *,
-        unknown_color: str = "#BDBDBD",
-    ) -> Tuple[List[str], Optional[np.ndarray]]:
-        if not hasattr(attGraph, "y") or attGraph.y is None:
-            return [self.style.default_vertex_color] * g_ig.vcount(), None
+        class_only: bool,
+        show_interclass_edges: bool,
+    ) -> Dict[tuple[int, int], str]:
+        colors = {}
 
-        y_cpu = attGraph.y.detach().cpu().numpy()
-        palette = list(self.style.subgraph_colors) if self.style.subgraph_colors else [self.style.default_vertex_color]
-        colors = []
-
-        for v in g_ig.vs:
-            old_id = new_to_old[v.index]
-            if old_id >= len(y_cpu) or int(y_cpu[old_id]) < 0:
-                colors.append(unknown_color)
+        for u, v in graph_nx.edges:
+            edge = (int(u), int(v))
+            if labels is None:
+                colors[edge] = self.style.edge_color
                 continue
-            label = int(y_cpu[old_id])
-            colors.append(palette[label % len(palette)])
 
-        return colors, y_cpu
+            u_label = int(labels[int(u)])
+            v_label = int(labels[int(v)])
+            same_class = u_label == v_label
 
-    def _edge_styles_from_labels(
-        self,
-        g_ig: ig.Graph,
-        new_to_old: Dict[int, int],
-        y_cpu: Optional[np.ndarray],
-        *,
-        color_intraclass_edges: bool = False,
-        intraclass_edge_color: str = "#A8A8A8",
-        interclass_edge_color: str = "#D95F02",
-        intraclass_edge_width: float = 0.45,
-        interclass_edge_width: float = 1.2,
-    ) -> Tuple[List[str], List[float]]:
-        palette = list(self.style.subgraph_colors) if self.style.subgraph_colors else [self.style.default_vertex_color]
-        edge_colors = []
-        edge_widths = []
-
-        if y_cpu is None:
-            return [intraclass_edge_color] * g_ig.ecount(), [intraclass_edge_width] * g_ig.ecount()
-
-        for edge in g_ig.es:
-            u_new, v_new = edge.tuple
-            u_old = new_to_old[u_new]
-            v_old = new_to_old[v_new]
-
-            same_label = False
-            if y_cpu is not None and u_old < len(y_cpu) and v_old < len(y_cpu):
-                same_label = int(y_cpu[u_old]) == int(y_cpu[v_old])
-
-            if same_label:
-                if color_intraclass_edges and y_cpu is not None:
-                    label = int(y_cpu[u_old])
-                    edge_colors.append(palette[label % len(palette)])
-                else:
-                    edge_colors.append(intraclass_edge_color)
-                edge_widths.append(intraclass_edge_width)
+            if same_class:
+                color = color_map.get(u_label, self.style.edge_color)
+                if not self.style.color_intraclass_edges:
+                    color = self.style.edge_color
+                colors[edge] = color
+            elif show_interclass_edges:
+                colors[edge] = self.style.interclass_edge_color
             else:
-                edge_colors.append(interclass_edge_color)
-                edge_widths.append(interclass_edge_width)
+                colors[edge] = self.style.interclass_edge_color
 
-        return edge_colors, edge_widths
+        return colors
 
-    def _labels_by_node(self, attGraph: AttributedGraph, nodes: Iterable[int]) -> Dict[int, Optional[int]]:
-        if not hasattr(attGraph, "y") or attGraph.y is None:
-            return {int(node): None for node in nodes}
-
-        y_cpu = attGraph.y.detach().cpu()
-        labels = {}
-        for node in nodes:
-            node = int(node)
-            if node >= y_cpu.numel() or int(y_cpu[node]) < 0:
-                labels[node] = None
-            else:
-                labels[node] = int(y_cpu[node])
-        return labels
-
-    def _sizes_from_nx_degree(
+    def _edge_alphas(
         self,
-        g_nx: nx.Graph,
-        size_range: Tuple[float, float],
-    ) -> Dict[int, float]:
-        vmin, vmax = size_range
-        degrees = dict(g_nx.degree())
-        if not degrees:
-            return {}
-
-        dmin = min(degrees.values())
-        dmax = max(degrees.values())
-        if dmin == dmax:
-            size = 0.5 * (vmin + vmax)
-            return {node: size for node in g_nx.nodes()}
-
-        sizes = {}
-        for node, degree in degrees.items():
-            t = (degree - dmin) / (dmax - dmin)
-            if self.style.degree_size_sqrt:
-                t = math.sqrt(t)
-            sizes[node] = vmin + t * (vmax - vmin)
-        return sizes
-
-    def _scatt_networkx_layout(
-        self,
-        g_nx: nx.Graph,
-        labels_by_node: Dict[int, Optional[int]],
+        graph_nx: nx.Graph,
+        labels: Optional[np.ndarray],
         *,
-        layout: str,
-        seed: Optional[int],
-        iterations: int,
-        community_gap: float,
+        edge_alpha: float,
+        show_interclass_edges: bool,
+    ) -> Dict[tuple[int, int], float]:
+        class_edge_alpha = self.style.class_edge_alpha if self.style.class_edge_alpha is not None else edge_alpha
+        interclass_edge_alpha = (
+            self.style.interclass_edge_alpha if self.style.interclass_edge_alpha is not None else edge_alpha
+        )
+        alphas = {}
+
+        for u, v in graph_nx.edges:
+            edge = (int(u), int(v))
+            if labels is None:
+                alphas[edge] = edge_alpha
+                continue
+
+            same_class = int(labels[int(u)]) == int(labels[int(v)])
+            if same_class:
+                alphas[edge] = class_edge_alpha
+            elif show_interclass_edges:
+                alphas[edge] = interclass_edge_alpha
+            else:
+                alphas[edge] = edge_alpha
+
+        return alphas
+
+    def _remove_interclass_edges(self, graph_nx: nx.Graph, labels: Optional[np.ndarray]) -> nx.Graph:
+        if labels is None:
+            return graph_nx
+
+        filtered = graph_nx.copy()
+        interclass_edges = [
+            (u, v)
+            for u, v in filtered.edges
+            if int(labels[int(u)]) != int(labels[int(v)])
+        ]
+        filtered.remove_edges_from(interclass_edges)
+        return filtered
+
+    def _fit_positions_to_unit_box(
+        self,
+        positions: Dict[int, np.ndarray],
     ) -> Dict[int, np.ndarray]:
-        layout = layout.lower().strip()
+        if not positions:
+            return positions
 
-        if g_nx.number_of_nodes() == 0:
-            return {}
+        nodes = list(positions)
+        xy = np.vstack([positions[node] for node in nodes]).astype(float)
+        xy_min = xy.min(axis=0)
+        xy_max = xy.max(axis=0)
+        span = xy_max - xy_min
+        span[span == 0.0] = 1.0
 
-        if layout in {"kamada", "kamada_kawai", "kk"}:
-            return nx.kamada_kawai_layout(g_nx)
-        if layout == "spectral":
-            return nx.spectral_layout(g_nx)
-        if layout in {"spring", "fr", "force"}:
-            k = 1.8 / math.sqrt(max(g_nx.number_of_nodes(), 1))
-            return nx.spring_layout(g_nx, seed=seed, k=k, iterations=iterations)
-        if layout not in {"community", "label_spring", "labels", "scatt", "community_blocks", "blocks"}:
-            raise ValueError(
-                "layout deve ser 'community', 'label_spring', 'community_blocks', "
-                "'spring', 'fr', 'kamada_kawai' ou 'spectral'."
-            )
+        pad = self.style.node_layout_pad_by
+        xy = (xy - xy_min) / span
+        xy = pad + xy * (1.0 - 2.0 * pad)
+        return {node: xy[idx] for idx, node in enumerate(nodes)}
 
-        groups: Dict[Optional[int], List[int]] = {}
-        for node in g_nx.nodes():
-            groups.setdefault(labels_by_node.get(node), []).append(node)
+    def _add_missing_positions(
+        self,
+        graph_nx: nx.Graph,
+        positions: Dict[int, np.ndarray],
+        node_to_community: Dict[int, int],
+    ) -> Dict[int, np.ndarray]:
+        missing_nodes = [int(node) for node in graph_nx.nodes if int(node) not in positions]
+        if not missing_nodes:
+            return positions
 
-        labels = sorted(groups.keys(), key=lambda item: (item is None, -1 if item is None else item))
-        if len(labels) == 1:
-            k = 1.8 / math.sqrt(max(g_nx.number_of_nodes(), 1))
-            return nx.spring_layout(g_nx, seed=seed, k=k, iterations=iterations)
+        community_to_positions: Dict[int, list[np.ndarray]] = {}
+        for node, position in positions.items():
+            community_to_positions.setdefault(node_to_community[node], []).append(position)
 
-        if layout in {"community", "label_spring", "labels", "scatt"}:
-            rng = np.random.default_rng(seed)
-            radius = community_gap * max(0.7, math.sqrt(len(labels)) / 2.0)
-            initial_pos = {}
-
-            for idx, label in enumerate(labels):
-                angle = 2 * math.pi * idx / len(labels)
-                center = np.array([radius * math.cos(angle), radius * math.sin(angle)])
-                nodes = groups[label]
-                jitter = 0.28 + 0.04 * math.sqrt(max(len(nodes), 1))
-
-                for node in nodes:
-                    initial_pos[node] = center + rng.normal(loc=0.0, scale=jitter, size=2)
-
-            k = 2.0 / math.sqrt(max(g_nx.number_of_nodes(), 1))
-            return nx.spring_layout(
-                g_nx,
-                pos=initial_pos,
-                seed=seed,
-                k=k,
-                iterations=iterations,
-                scale=max(2.2, community_gap),
-            )
-
-        radius = community_gap * max(1.0, len(labels) / 3)
-        positions: Dict[int, np.ndarray] = {}
-
-        for idx, label in enumerate(labels):
-            angle = 2 * math.pi * idx / len(labels)
-            center = np.array([radius * math.cos(angle), radius * math.sin(angle)])
-            nodes = groups[label]
-            subgraph = g_nx.subgraph(nodes).copy()
-
-            if len(nodes) == 1:
-                local_pos = {nodes[0]: np.array([0.0, 0.0])}
+        global_center = np.mean(list(positions.values()), axis=0) if positions else np.array([0.5, 0.5])
+        rng = np.random.default_rng(self.style.seed)
+        for node in missing_nodes:
+            community = node_to_community[node]
+            if community in community_to_positions:
+                center = np.mean(community_to_positions[community], axis=0)
             else:
-                local_k = 1.9 / math.sqrt(max(len(nodes), 1))
-                local_pos = nx.spring_layout(
-                    subgraph,
-                    seed=None if seed is None else seed + idx,
-                    k=local_k,
-                    iterations=iterations,
-                    scale=1.0,
-                )
-
-            for node, xy in local_pos.items():
-                positions[node] = np.asarray(xy, dtype=float) + center
+                center = global_center
+            positions[node] = center + 0.015 * rng.normal(size=2)
 
         return positions
 
-    def _plot_scatt_graph_networkx(
+    def _complete_node_positions(
         self,
-        g_nx: nx.Graph,
-        attGraph: AttributedGraph,
-        *,
-        layout: str,
-        seed: Optional[int],
-        iterations: int,
-        community_gap: float,
-        show_labels: Optional[bool],
-        node_size_range: Tuple[float, float],
-        node_edge_color: str,
-        node_edge_width: float,
-        intraclass_edge_color: str,
-        interclass_edge_color: str,
-        intraclass_edge_width: float,
-        interclass_edge_width: float,
-        color_intraclass_edges: bool,
-        highlight_interclass_edges: bool,
-        community_halos: bool,
-        halo_alpha: float,
-        edge_alpha: float,
-        interclass_edge_alpha: float,
-        legend: bool,
-        save_path: Optional[str],
-        dpi: Optional[int],
-        figsize: Optional[Tuple[float, float]],
-        title: str,
-    ):
-        labels_by_node = self._labels_by_node(attGraph, g_nx.nodes())
-        positions = self._scatt_networkx_layout(
-            g_nx,
-            labels_by_node,
-            layout=layout,
-            seed=seed,
-            iterations=iterations,
-            community_gap=community_gap,
-        )
+        graph_nx: nx.Graph,
+        positions: Dict[int, np.ndarray],
+        labels: Optional[np.ndarray],
+    ) -> Dict[int, np.ndarray]:
+        missing_nodes = [int(node) for node in graph_nx.nodes if int(node) not in positions]
+        if not missing_nodes:
+            return positions
 
-        palette = list(self.style.subgraph_colors) if self.style.subgraph_colors else [self.style.default_vertex_color]
-        node_sizes = self._sizes_from_nx_degree(g_nx, node_size_range)
-        labels = sorted({label for label in labels_by_node.values() if label is not None})
+        rng = np.random.default_rng(self.style.seed)
+        if labels is None or not positions:
+            center = np.mean(list(positions.values()), axis=0) if positions else np.array([0.5, 0.5])
+            for node in missing_nodes:
+                positions[node] = center + 0.015 * rng.normal(size=2)
+            return positions
 
-        fig_dpi = dpi if dpi is not None else self.style.dpi
-        fig_size = figsize or self.style.figsize or (10, 8)
-        fig, ax = plt.subplots(1, 1, figsize=fig_size, dpi=fig_dpi)
-        ax.set_facecolor("#FAFAFA")
-        fig.patch.set_facecolor("#FAFAFA")
-        ax.axis("off")
-        ax.set_aspect("equal")
+        community_to_positions: Dict[int, list[np.ndarray]] = {}
+        for node, position in positions.items():
+            community_to_positions.setdefault(int(labels[int(node)]), []).append(position)
 
-        if community_halos and labels:
-            self._draw_community_halos(
-                ax=ax,
-                positions=positions,
-                labels_by_node=labels_by_node,
-                labels=labels,
-                palette=palette,
-                alpha=halo_alpha,
+        global_center = np.mean(list(positions.values()), axis=0)
+        for node in missing_nodes:
+            community = int(labels[int(node)])
+            if community in community_to_positions:
+                center = np.mean(community_to_positions[community], axis=0)
+            else:
+                center = global_center
+            positions[node] = center + 0.015 * rng.normal(size=2)
+
+        return positions
+
+    def _spaced_community_layout(
+        self,
+        graph_nx: nx.Graph,
+        labels: Optional[np.ndarray],
+        community_distance: float,
+    ) -> Optional[Dict[int, np.ndarray]]:
+        if labels is None:
+            return None
+
+        node_to_community = self._node_to_community(graph_nx, labels)
+        communities = sorted(set(node_to_community.values()))
+        if len(communities) < 2:
+            return None
+
+        community_to_nodes: Dict[int, list[int]] = {}
+        for node, community in node_to_community.items():
+            community_to_nodes.setdefault(community, []).append(node)
+
+        center_radius = 0.34 * community_distance
+        local_scale = 0.11 / max(community_distance, 0.25)
+        community_centers = {}
+        for idx, community in enumerate(communities):
+            angle = 2.0 * np.pi * idx / len(communities)
+            community_centers[community] = np.array(
+                [
+                    0.5 + center_radius * np.cos(angle),
+                    0.5 + center_radius * np.sin(angle),
+                ]
             )
 
-        intra_edges = []
-        inter_edges = []
-        for u, v in g_nx.edges():
-            if labels_by_node.get(u) is not None and labels_by_node.get(u) == labels_by_node.get(v):
-                intra_edges.append((u, v))
-            else:
-                inter_edges.append((u, v))
+        spaced_positions = {}
+        rng = np.random.default_rng(self.style.seed)
+        for community in communities:
+            nodes = sorted(community_to_nodes[community])
+            center = community_centers[community]
+            if len(nodes) == 1:
+                spaced_positions[nodes[0]] = center
+                continue
 
-        if color_intraclass_edges:
-            for label in labels:
-                edges = [(u, v) for u, v in intra_edges if labels_by_node.get(u) == label]
-                edge_artist = nx.draw_networkx_edges(
-                    g_nx,
-                    positions,
-                    edgelist=edges,
-                    ax=ax,
-                    width=intraclass_edge_width,
-                    edge_color=palette[label % len(palette)],
-                    alpha=edge_alpha,
+            subgraph = graph_nx.subgraph(nodes)
+            try:
+                local_positions = nx.spring_layout(
+                    subgraph,
+                    seed=self.style.seed + int(community),
+                    iterations=80,
                 )
-                if edge_artist is not None:
-                    edge_artist.set_zorder(1)
-        else:
-            edge_artist = nx.draw_networkx_edges(
-                g_nx,
-                positions,
-                edgelist=intra_edges,
-                ax=ax,
-                width=intraclass_edge_width,
-                edge_color=intraclass_edge_color,
-                alpha=edge_alpha,
-            )
-            if edge_artist is not None:
-                edge_artist.set_zorder(1)
+            except ValueError:
+                local_positions = {}
 
-        if highlight_interclass_edges:
-            edge_artist = nx.draw_networkx_edges(
-                g_nx,
-                positions,
-                edgelist=inter_edges,
-                ax=ax,
-                width=interclass_edge_width,
-                edge_color=interclass_edge_color,
-                alpha=interclass_edge_alpha,
-            )
-            if edge_artist is not None:
-                edge_artist.set_zorder(2)
-
-        for label in labels:
-            nodes = [node for node, node_label in labels_by_node.items() if node_label == label]
-            node_artist = nx.draw_networkx_nodes(
-                g_nx,
-                positions,
-                nodelist=nodes,
-                node_size=[node_sizes[node] for node in nodes],
-                node_color=palette[label % len(palette)],
-                edgecolors=node_edge_color,
-                linewidths=node_edge_width,
-                alpha=0.96,
-                ax=ax,
-                label=f"Classe {label}",
-            )
-            node_artist.set_zorder(3)
-
-        unknown_nodes = [node for node, label in labels_by_node.items() if label is None]
-        if unknown_nodes:
-            node_artist = nx.draw_networkx_nodes(
-                g_nx,
-                positions,
-                nodelist=unknown_nodes,
-                node_size=[node_sizes[node] for node in unknown_nodes],
-                node_color="#BDBDBD",
-                edgecolors=node_edge_color,
-                linewidths=node_edge_width,
-                alpha=0.9,
-                ax=ax,
-                label="Sem rotulo",
-            )
-            node_artist.set_zorder(3)
-
-        show = self.style.show_labels if show_labels is None else show_labels
-        if show:
-            nx.draw_networkx_labels(
-                g_nx,
-                positions,
-                labels={node: str(node) for node in g_nx.nodes()},
-                font_size=self.style.label_size,
-                font_color="#222222",
-                ax=ax,
-            )
-
-        if self.style.add_titles:
-            ax.set_title(title, fontsize=12, color="#222222", pad=12)
-
-        if legend and labels:
-            ax.legend(
-                loc="upper right",
-                frameon=True,
-                framealpha=0.92,
-                facecolor="white",
-                edgecolor="#DDDDDD",
-                fontsize=9,
-            )
-
-        plt.tight_layout()
-        if save_path:
-            fig.savefig(save_path, dpi=fig_dpi, bbox_inches="tight", facecolor=fig.get_facecolor())
-
-        return fig, ax
-
-    def _plot_scatt_graph_netgraph(
-        self,
-        g_nx: nx.Graph,
-        attGraph: AttributedGraph,
-        *,
-        layout: str,
-        seed: Optional[int],
-        iterations: int,
-        community_gap: float,
-        show_labels: Optional[bool],
-        node_size_range: Tuple[float, float],
-        node_edge_color: str,
-        node_edge_width: float,
-        intraclass_edge_color: str,
-        interclass_edge_color: str,
-        intraclass_edge_width: float,
-        interclass_edge_width: float,
-        color_intraclass_edges: bool,
-        highlight_interclass_edges: bool,
-        edge_alpha: float,
-        interclass_edge_alpha: float,
-        legend: bool,
-        save_path: Optional[str],
-        dpi: Optional[int],
-        figsize: Optional[Tuple[float, float]],
-        title: str,
-        edge_layout: str,
-        edge_bundle_k: int,
-    ):
-        try:
-            from netgraph import Graph
-        except ImportError as exc:
-            raise ImportError(
-                "O backend 'netgraph' precisa do pacote netgraph. "
-                "Instale com: pip install netgraph"
-            ) from exc
-
-        labels_by_node = self._labels_by_node(attGraph, g_nx.nodes())
-        palette = list(self.style.subgraph_colors) if self.style.subgraph_colors else [self.style.default_vertex_color]
-        labels = sorted({label for label in labels_by_node.values() if label is not None})
-
-        node_color = {}
-        node_edge_color_map = {}
-        for node in g_nx.nodes():
-            label = labels_by_node.get(node)
-            node_color[node] = "#BDBDBD" if label is None else palette[label % len(palette)]
-            node_edge_color_map[node] = node_edge_color
-
-        nx_sizes = self._sizes_from_nx_degree(g_nx, node_size_range)
-        node_size = {
-            node: max(2.4, math.sqrt(nx_sizes.get(node, node_size_range[0])) / 4.2)
-            for node in g_nx.nodes()
-        }
-
-        edge_color = {}
-        edge_width = {}
-        for u, v in g_nx.edges():
-            same_label = labels_by_node.get(u) is not None and labels_by_node.get(u) == labels_by_node.get(v)
-            if same_label:
-                if color_intraclass_edges:
-                    label = labels_by_node[u]
-                    edge_color[(u, v)] = palette[label % len(palette)]
-                else:
-                    edge_color[(u, v)] = intraclass_edge_color
-                edge_width[(u, v)] = intraclass_edge_width
-            else:
-                edge_color[(u, v)] = interclass_edge_color if highlight_interclass_edges else intraclass_edge_color
-                edge_width[(u, v)] = interclass_edge_width if highlight_interclass_edges else intraclass_edge_width
-
-        if edge_layout == "bundled":
-            edge_alpha_value = edge_alpha
-        elif highlight_interclass_edges:
-            edge_alpha_value = min(1.0, max(edge_alpha, interclass_edge_alpha))
-        else:
-            edge_alpha_value = edge_alpha
-
-        layout = layout.lower().strip()
-        if layout in {"community", "community_blocks", "blocks", "scatt"}:
-            node_layout = "community"
-            node_layout_kwargs = {
-                "node_to_community": {
-                    node: (-1 if labels_by_node.get(node) is None else labels_by_node[node])
-                    for node in g_nx.nodes()
+            if len(local_positions) != len(nodes):
+                angles = np.linspace(0.0, 2.0 * np.pi, len(nodes), endpoint=False)
+                rng.shuffle(angles)
+                local_positions = {
+                    node: np.array([np.cos(angle), np.sin(angle)])
+                    for node, angle in zip(nodes, angles)
                 }
+
+            local_xy = np.vstack([local_positions[node] for node in nodes]).astype(float)
+            local_xy -= local_xy.mean(axis=0)
+            max_abs = np.abs(local_xy).max()
+            if max_abs > 0.0:
+                local_xy /= max_abs
+
+            scale = local_scale * np.sqrt(len(nodes) / max(len(graph_nx), 1))
+            scale = max(scale, 0.035)
+            for idx, node in enumerate(nodes):
+                spaced_positions[node] = center + scale * local_xy[idx]
+
+        return self._fit_positions_to_unit_box(spaced_positions)
+
+    def _normalize_node_layout(self, layout: str) -> str:
+        layout = layout.lower().strip()
+        aliases = {
+            "fr": "spring",
+            "force": "spring",
+            "fruchterman_reingold": "spring",
+            "circle": "circular",
+        }
+        return aliases.get(layout, layout)
+
+    def _normalize_edge_layout(self, layout: str) -> str:
+        layout = layout.lower().strip()
+        aliases = {
+            "bundle": "bundled",
+            "curves": "curved",
+        }
+        return aliases.get(layout, layout)
+
+    def _graph_kwargs(
+        self,
+        graph_nx: nx.Graph,
+        labels: Optional[np.ndarray],
+        *,
+        node_layout: str,
+        edge_layout: str,
+        class_id: Optional[int],
+        show_interclass_edges: bool,
+        edge_alpha: float,
+        community_distance: float,
+        node_positions: Optional[Dict[int, Sequence[float]]],
+        ax,
+    ) -> Dict[str, Any]:
+        color_map = self._class_colors(labels)
+        active_node_layout: str | Dict[int, np.ndarray] = node_layout
+        if node_positions is not None:
+            active_node_layout = {
+                int(node): np.asarray(position, dtype=float)
+                for node, position in node_positions.items()
+                if int(node) in graph_nx
             }
-        elif layout in {"label_spring", "labels"}:
-            node_layout = self._scatt_networkx_layout(
-                g_nx,
-                labels_by_node,
-                layout="community",
-                seed=seed,
-                iterations=iterations,
-                community_gap=community_gap,
-            )
-            node_layout_kwargs = None
-        elif layout in {"spring", "fr", "force"}:
-            node_layout = "spring"
-            node_layout_kwargs = {
-                "total_iterations": iterations,
-                "node_positions": None,
-            }
-        elif layout in {"circular", "shell"}:
-            node_layout = layout
-            node_layout_kwargs = None
-        else:
-            raise ValueError(
-                "Para backend='netgraph', use layout='community', 'label_spring', "
-                "'spring', 'circular' ou 'shell'."
-            )
+            active_node_layout = self._complete_node_positions(graph_nx, active_node_layout, labels)
+        elif node_layout == "community":
+            spaced_layout = self._spaced_community_layout(graph_nx, labels, community_distance)
+            if spaced_layout is not None:
+                active_node_layout = spaced_layout
 
-        if edge_layout not in {"straight", "curved", "bundled"}:
-            raise ValueError("edge_layout deve ser 'straight', 'curved' ou 'bundled'.")
-
-        fig_dpi = dpi if dpi is not None else self.style.dpi
-        fig_size = figsize or self.style.figsize or (7.2, 6.2)
-        fig, ax = plt.subplots(1, 1, figsize=fig_size, dpi=fig_dpi)
-        fig.patch.set_facecolor("white")
-        ax.set_facecolor("white")
-        ax.axis("off")
-        ax.set_aspect("equal")
-
-        graph_kwargs = {
-            "node_color": node_color,
-            "node_edge_color": node_edge_color_map,
-            "node_edge_width": node_edge_width,
-            "node_size": node_size,
-            "node_alpha": 0.98,
-            "edge_color": edge_color,
-            "edge_width": edge_width,
-            "edge_alpha": edge_alpha_value,
+        kwargs: Dict[str, Any] = {
+            "node_color": self._node_colors(graph_nx, labels, color_map, class_id),
+            "node_edge_width": self.style.node_edge_width,
+            "edge_color": self._edge_colors(
+                graph_nx,
+                labels,
+                color_map,
+                class_only=class_id is not None,
+                show_interclass_edges=show_interclass_edges,
+            ),
+            "edge_width": self.style.edge_width,
+            "edge_alpha": self._edge_alphas(
+                graph_nx,
+                labels,
+                edge_alpha=edge_alpha,
+                show_interclass_edges=show_interclass_edges,
+            ),
+            "node_layout": active_node_layout,
             "edge_layout": edge_layout,
-            "node_layout": node_layout,
-            "node_layout_kwargs": node_layout_kwargs,
-            "arrows": False,
             "ax": ax,
         }
 
+        if self.style.node_size is not None:
+            kwargs["node_size"] = self.style.node_size
+
+        if node_layout == "community" and active_node_layout == node_layout:
+            kwargs["node_layout_kwargs"] = {
+                "node_to_community": self._node_to_community(graph_nx, labels),
+                "pad_by": self.style.node_layout_pad_by,
+            }
+
         if edge_layout == "bundled":
-            graph_kwargs["edge_layout_kwargs"] = {"k": edge_bundle_k}
+            kwargs["edge_layout_kwargs"] = {
+                "k": self.style.edge_bundle_k,
+            }
 
-        if show_labels:
-            graph_kwargs["node_labels"] = {node: str(node) for node in g_nx.nodes()}
-            graph_kwargs["node_label_fontdict"] = {"size": self.style.label_size, "color": "#222222"}
+        return kwargs
 
-        Graph(g_nx, **graph_kwargs)
-
-        if self.style.add_titles:
-            ax.set_title(title, fontsize=11, color="#222222", pad=10)
-
-        if legend and labels:
-            handles = [
-                Line2D(
-                    [0],
-                    [0],
-                    marker="o",
-                    linestyle="",
-                    markersize=7,
-                    markerfacecolor=palette[label % len(palette)],
-                    markeredgecolor=node_edge_color,
-                    label=f"Classe {label}",
-                )
-                for label in labels
-            ]
-            ax.legend(
-                handles=handles,
-                loc="upper right",
-                frameon=True,
-                framealpha=0.95,
-                facecolor="white",
-                edgecolor="#DDDDDD",
-                fontsize=8,
-            )
-
-        plt.tight_layout()
-        if save_path:
-            fig.savefig(save_path, dpi=fig_dpi, bbox_inches="tight", facecolor=fig.get_facecolor())
-
-        return fig, ax
-
-    def _draw_community_halos(
+    def get_node_positions(
         self,
+        graph: AttributedGraph,
         *,
-        ax,
-        positions: Dict[int, np.ndarray],
-        labels_by_node: Dict[int, Optional[int]],
-        labels: Sequence[int],
-        palette: Sequence[str],
-        alpha: float,
-    ):
-        for label in labels:
-            nodes = [node for node, node_label in labels_by_node.items() if node_label == label and node in positions]
-            if not nodes:
-                continue
+        class_id: Optional[int] = None,
+        layout: Optional[str] = None,
+        node_layout: Optional[str] = None,
+        community_distance: Optional[float] = None,
+    ) -> Dict[int, np.ndarray]:
+        """Compute reusable node positions for repeated plots of comparable graphs."""
+        if not isinstance(graph, AttributedGraph):
+            raise TypeError("get_node_positions espera um objeto AttributedGraph.")
 
-            xy = np.array([positions[node] for node in nodes], dtype=float)
-            center = xy.mean(axis=0)
+        labels = _as_label_array(graph.y)
+        selected_nodes = None if class_id is None else self._class_nodes(graph, class_id)
+        graph_nx = _networkit_to_networkx(graph.graph, selected_nodes)
+        if graph_nx.number_of_nodes() == 0:
+            raise ValueError(f"Nenhum no encontrado para class_id={class_id}.")
 
-            if xy.shape[0] == 1:
-                width = height = 0.65
-                angle = 0.0
-            else:
-                cov = np.cov(xy.T)
-                cov = cov + np.eye(2) * 1e-4
-                eigvals, eigvecs = np.linalg.eigh(cov)
-                order = np.argsort(eigvals)[::-1]
-                eigvals = eigvals[order]
-                eigvecs = eigvecs[:, order]
+        active_node_layout = self._normalize_node_layout(
+            node_layout or layout or ("spring" if class_id is not None else self.style.node_layout)
+        )
+        effective_community_distance = (
+            community_distance if community_distance is not None else self.style.community_distance
+        )
 
-                width = max(0.75, 4.4 * math.sqrt(float(eigvals[0])))
-                height = max(0.75, 4.4 * math.sqrt(float(eigvals[1])))
-                angle = math.degrees(math.atan2(float(eigvecs[1, 0]), float(eigvecs[0, 0])))
+        if active_node_layout == "community":
+            positions = self._spaced_community_layout(graph_nx, labels, effective_community_distance)
+            if positions is not None:
+                return positions
 
-            color = palette[label % len(palette)]
-            halo = Ellipse(
-                xy=center,
-                width=width,
-                height=height,
-                angle=angle,
-                facecolor=color,
-                edgecolor=color,
-                linewidth=1.2,
-                alpha=alpha,
-                zorder=0,
-            )
-            ax.add_patch(halo)
+        if active_node_layout in {"spring", "fr"}:
+            return {
+                int(node): np.asarray(position, dtype=float)
+                for node, position in nx.spring_layout(
+                    graph_nx,
+                    seed=self.style.seed,
+                    iterations=100,
+                ).items()
+            }
 
-    def _plot_one(
-        self,
-        ax,
-        g_ig: ig.Graph,
-        layout: ig.Layout,
-        vertex_color: Union[str, Sequence[str]],
-        vertex_sizes: List[float],
-        vertex_labels: Optional[List[str]],
-        title: Optional[str],
-    ):
-        ax.axis("off")
+        if active_node_layout == "circular":
+            return {
+                int(node): np.asarray(position, dtype=float)
+                for node, position in nx.circular_layout(graph_nx).items()
+            }
+
+        if active_node_layout == "spectral":
+            return {
+                int(node): np.asarray(position, dtype=float)
+                for node, position in nx.spectral_layout(graph_nx).items()
+            }
+
+        raise ValueError("layout deve ser 'community', 'spring', 'circular' ou 'spectral'.")
+
+    def _finish_axes(self, ax, title: Optional[str]) -> None:
+        ax.set_facecolor(self.style.background)
         ax.set_aspect("equal")
-        ig.plot(
-            g_ig,
-            target=ax,
-            layout=layout,
-            bbox=self.style.bbox,
-            margin=self.style.margin,
-            vertex_color=vertex_color,
-            vertex_size=vertex_sizes,
-            vertex_label=vertex_labels,
-            vertex_label_size=self.style.label_size,
-            edge_width=self.style.edge_width,
+        ax.axis("off")
+        if title:
+            ax.set_title(title, fontsize=self.style.title_size, pad=8)
+
+    def _add_legend(self, ax, color_map: Dict[int, str], labels: Optional[np.ndarray], class_id: Optional[int]) -> None:
+        if not self.style.show_legend or labels is None:
+            return
+
+        class_values = [int(class_id)] if class_id is not None else sorted(color_map)
+        handles = [
+            Line2D(
+                [0],
+                [0],
+                marker="o",
+                linestyle="",
+                markerfacecolor=color_map[value],
+                markeredgecolor=self.style.node_edge_color,
+                markersize=6,
+                label=str(value),
+            )
+            for value in class_values
+            if value in color_map
+        ]
+        if not handles:
+            return
+
+        ax.legend(
+            handles=handles,
+            title=self.style.legend_title,
+            frameon=False,
+            fontsize=self.style.font_size,
+            title_fontsize=self.style.font_size,
+            loc="upper right",
+            bbox_to_anchor=(1.02, 1.02),
         )
-        if title and self.style.add_titles:
-            ax.set_title(title, fontsize=11)
-
-
-    def plot_full_graph(
-        self,
-        attGraph: AttributedGraph,
-        *,
-        layout: Optional[Union[str, ig.Layout]] = "drl",   # "drl" costuma espalhar bem
-        show_labels: Optional[bool] = None,
-        color_by_label: bool = False,
-        only_linked: bool = True,          # remove nós com grau 0
-        keep: str = "lcc",                  # "lcc" | "all"
-        save_path: Optional[str] = None,
-        dpi: Optional[int] = None,
-        figsize: Optional[Tuple[float, float]] = None,
-        title: str = "Grafo completo (filtrado)",
-        bbox: Optional[Tuple[int, int]] = None,
-        margin: Optional[int] = None,
-    ):
-        g_nk = attGraph.graph
-
-        # -----------------------------
-        # 1) Filtrar nós sem ligação
-        # -----------------------------
-        nodes = list(g_nk.iterNodes())
-
-        if only_linked:
-            nodes = [u for u in nodes if g_nk.degree(u) > 0]
-
-        if len(nodes) == 0:
-            raise ValueError("Após filtrar nós sem ligação (grau 0), não sobrou nenhum nó para plotar.")
-
-        # subgrafo induzido nesses nós
-        g_f = nk.graphtools.subgraphFromNodes(g_nk, nodes)
-
-        # -----------------------------
-        # 2) Opcional: manter apenas a LCC
-        # -----------------------------
-        keep = keep.lower().strip()
-        if keep not in {"lcc", "all"}:
-            raise ValueError("keep deve ser 'lcc' ou 'all'.")
-
-        if keep == "lcc":
-            cc = nk.components.ConnectedComponents(g_f)
-            cc.run()
-            comps = cc.getComponents()
-            if len(comps) == 0:
-                raise ValueError("Nenhuma componente encontrada no grafo filtrado.")
-            lcc_nodes = max(comps, key=len)
-            g_f = nk.graphtools.subgraphFromNodes(g_f, lcc_nodes)
-
-        # -----------------------------
-        # 3) Converter para igraph (já remapeando)
-        # -----------------------------
-        g_ig, _, new_to_old = nk_to_igraph_remap(g_f)
-
-        # -----------------------------
-        # 4) Layout + ajustes para espalhar melhor
-        # -----------------------------
-        lay = self._resolve_layout(g_ig, layout=layout)
-
-        # Ajustes visuais recomendados para grafos maiores:
-        # - aumentar bbox e margin
-        # - diminuir tamanho dos nós
-        n = g_ig.vcount()
-        if bbox is None:
-            # bbox cresce com n (regra simples)
-            side = int(900 + min(2500, 15 * math.sqrt(max(n, 1)) * 20))
-            bbox = (side, side)
-        if margin is None:
-            margin = 60
-
-        # sobrescreve temporariamente bbox/margin do style no plot
-        old_bbox = self.style.bbox
-        old_margin = self.style.margin
-        self.style.bbox = bbox
-        self.style.margin = margin
-
-        # tamanhos de nós menores para não virar “bolinha” gigante no centro
-        old_vs = self.style.vertex_size_range
-        self.style.vertex_size_range = (2.0, 8.0)
-
-        sizes = self._sizes_from_degree(g_ig)
-        labels = self._labels_from_mapping(g_ig, new_to_old, show_labels=show_labels)
-
-        # cores
-        if color_by_label and hasattr(attGraph, "y") and attGraph.y is not None:
-            y_cpu = attGraph.y.detach().cpu().numpy()
-            palette = list(self.style.subgraph_colors) if self.style.subgraph_colors else [self.style.default_vertex_color]
-            colors = []
-            for v in g_ig.vs:
-                old_id = new_to_old[v.index]
-                c = int(y_cpu[old_id])
-                colors.append(palette[c % len(palette)])
-            vertex_color = colors
-        else:
-            vertex_color = self.style.default_vertex_color
-
-        # figura
-        fig_dpi = dpi if dpi is not None else self.style.dpi
-        if figsize is None:
-            fig_size = self.style.figsize or (9, 9)
-        else:
-            fig_size = figsize
-
-        fig, ax = plt.subplots(1, 1, figsize=fig_size, dpi=fig_dpi)
-        self._plot_one(
-            ax=ax,
-            g_ig=g_ig,
-            layout=lay,
-            vertex_color=vertex_color,
-            vertex_sizes=sizes,
-            vertex_labels=labels,
-            title=title,
-        )
-
-        plt.tight_layout()
-        if save_path:
-            fig.savefig(save_path, dpi=fig_dpi, bbox_inches="tight")
-
-        # restaura style
-        self.style.bbox = old_bbox
-        self.style.margin = old_margin
-        self.style.vertex_size_range = old_vs
-
-        return fig, ax
 
     def plot_scatt_graph(
         self,
-        attGraph: AttributedGraph,
+        graph: AttributedGraph,
         *,
-        layout: Optional[Union[str, ig.Layout]] = "community",
-        backend: str = "networkx",
-        only_linked: bool = True,
-        keep: str = "all",
-        color_intraclass_edges: bool = False,
-        highlight_interclass_edges: bool = True,
-        show_labels: Optional[bool] = None,
-        vertex_size_range: Tuple[float, float] = (180.0, 620.0),
-        node_edge_color: str = "#FFFFFF",
-        node_edge_width: float = 1.2,
-        intraclass_edge_color: str = "#C9CED6",
-        interclass_edge_color: str = "#D95F02",
-        intraclass_edge_width: float = 0.8,
-        interclass_edge_width: float = 1.7,
-        community_halos: bool = True,
-        halo_alpha: float = 0.10,
-        edge_alpha: float = 0.28,
-        interclass_edge_alpha: float = 0.82,
-        seed: Optional[int] = 42,
-        iterations: int = 180,
-        community_gap: float = 2.4,
-        legend: bool = True,
-        netgraph_edge_layout: str = "curved",
-        netgraph_bundle_k: int = 2000,
-        save_path: Optional[str] = None,
-        dpi: Optional[int] = None,
+        class_id: Optional[int] = None,
+        layout: Optional[str] = None,
+        node_layout: Optional[str] = None,
+        edge_layout: Optional[str] = None,
+        title: Optional[str] = None,
+        show_interclass_edges: bool = True,
+        edge_alpha: Optional[float] = None,
+        community_distance: Optional[float] = None,
+        node_positions: Optional[Dict[int, Sequence[float]]] = None,
+        ax=None,
+        save_path: Optional[str | Path] = None,
         figsize: Optional[Tuple[float, float]] = None,
-        title: str = "Grafo gerado pelo SCAtt",
+        dpi: Optional[int] = None,
     ):
         """
-        Plota um AttributedGraph produzido pelo SCAtt.
+        Plot a complete SCAtt graph or an induced subgraph for one class using netgraph.
 
-        - Nos sao coloridos por `attGraph.y`.
-        - O backend padrao usa NetworkX/Matplotlib para vertices maiores e legenda.
-        - Arestas interclasse podem ser destacadas para visualizar o ruido/heterofilia.
+        ``layout`` is kept as a short alias for ``node_layout``. The default full
+        graph view uses netgraph's community node layout and bundled edge layout.
         """
-
-        if not isinstance(attGraph, AttributedGraph):
+        if not isinstance(graph, AttributedGraph):
             raise TypeError("plot_scatt_graph espera um objeto AttributedGraph.")
+        if Graph is None:
+            raise ImportError("O plot agora usa netgraph. Instale com `pip install netgraph`.") from _NETGRAPH_IMPORT_ERROR
 
-        g_nk = attGraph.graph
-        nodes = list(g_nk.iterNodes())
+        labels = _as_label_array(graph.y)
+        selected_nodes = None if class_id is None else self._class_nodes(graph, class_id)
+        graph_nx = _networkit_to_networkx(graph.graph, selected_nodes)
+        if class_id is None and not show_interclass_edges:
+            graph_nx = self._remove_interclass_edges(graph_nx, labels)
 
-        if only_linked:
-            nodes = [u for u in nodes if g_nk.degree(u) > 0]
+        if graph_nx.number_of_nodes() == 0:
+            raise ValueError(f"Nenhum no encontrado para class_id={class_id}.")
 
-        if len(nodes) == 0:
-            raise ValueError("Nao sobrou nenhum no para plotar depois do filtro only_linked.")
-
-        g_f = nk.graphtools.subgraphFromNodes(g_nk, nodes)
-
-        keep = keep.lower().strip()
-        if keep not in {"all", "lcc"}:
-            raise ValueError("keep deve ser 'all' ou 'lcc'.")
-
-        if keep == "lcc":
-            cc = nk.components.ConnectedComponents(g_f)
-            cc.run()
-            comps = cc.getComponents()
-            if len(comps) == 0:
-                raise ValueError("Nenhuma componente encontrada no grafo filtrado.")
-            g_f = nk.graphtools.subgraphFromNodes(g_f, max(comps, key=len))
-
-        backend = backend.lower().strip()
-        if backend not in {"networkx", "igraph", "netgraph"}:
-            raise ValueError("backend deve ser 'networkx', 'igraph' ou 'netgraph'.")
-
-        if backend == "networkx":
-            layout_name = layout if isinstance(layout, str) else "spring"
-            return self._plot_scatt_graph_networkx(
-                nk_to_networkx(g_f),
-                attGraph,
-                layout=layout_name,
-                seed=seed,
-                iterations=iterations,
-                community_gap=community_gap,
-                show_labels=show_labels,
-                node_size_range=vertex_size_range,
-                node_edge_color=node_edge_color,
-                node_edge_width=node_edge_width,
-                intraclass_edge_color=intraclass_edge_color,
-                interclass_edge_color=interclass_edge_color,
-                intraclass_edge_width=intraclass_edge_width,
-                interclass_edge_width=interclass_edge_width,
-                color_intraclass_edges=color_intraclass_edges,
-                highlight_interclass_edges=highlight_interclass_edges,
-                community_halos=community_halos,
-                halo_alpha=halo_alpha,
-                edge_alpha=edge_alpha,
-                interclass_edge_alpha=interclass_edge_alpha,
-                legend=legend,
-                save_path=save_path,
-                dpi=dpi,
-                figsize=figsize,
-                title=title,
-            )
-
-        if backend == "netgraph":
-            layout_name = layout if isinstance(layout, str) else "community"
-            return self._plot_scatt_graph_netgraph(
-                nk_to_networkx(g_f),
-                attGraph,
-                layout=layout_name,
-                seed=seed,
-                iterations=iterations,
-                community_gap=community_gap,
-                show_labels=show_labels,
-                node_size_range=vertex_size_range,
-                node_edge_color=node_edge_color,
-                node_edge_width=node_edge_width,
-                intraclass_edge_color=intraclass_edge_color,
-                interclass_edge_color=interclass_edge_color,
-                intraclass_edge_width=intraclass_edge_width,
-                interclass_edge_width=interclass_edge_width,
-                color_intraclass_edges=color_intraclass_edges,
-                highlight_interclass_edges=highlight_interclass_edges,
-                edge_alpha=edge_alpha,
-                interclass_edge_alpha=interclass_edge_alpha,
-                legend=legend,
-                save_path=save_path,
-                dpi=dpi,
-                figsize=figsize,
-                title=title,
-                edge_layout=netgraph_edge_layout,
-                edge_bundle_k=netgraph_bundle_k,
-            )
-
-        g_ig, _, new_to_old = nk_to_igraph_remap(g_f)
-        lay = self._resolve_layout(g_ig, layout=layout)
-
-        vertex_colors, y_cpu = self._colors_from_labels(attGraph, g_ig, new_to_old)
-        labels = self._labels_from_mapping(g_ig, new_to_old, show_labels=show_labels)
-
-        old_vs = self.style.vertex_size_range
-        igraph_size_range = (
-            max(4.0, math.sqrt(vertex_size_range[0]) / 2.0),
-            max(8.0, math.sqrt(vertex_size_range[1]) / 1.8),
+        active_node_layout = self._normalize_node_layout(
+            node_layout or layout or ("spring" if class_id is not None else self.style.node_layout)
         )
-        self.style.vertex_size_range = igraph_size_range
-        vertex_sizes = self._sizes_from_degree(g_ig)
-        self.style.vertex_size_range = old_vs
+        active_edge_layout = self._normalize_edge_layout(
+            edge_layout or ("straight" if class_id is not None else self.style.edge_layout)
+        )
 
-        if highlight_interclass_edges:
-            edge_colors, edge_widths = self._edge_styles_from_labels(
-                g_ig,
-                new_to_old,
-                y_cpu,
-                color_intraclass_edges=color_intraclass_edges,
-                intraclass_edge_color=intraclass_edge_color,
-                interclass_edge_color=interclass_edge_color,
-                intraclass_edge_width=intraclass_edge_width,
-                interclass_edge_width=interclass_edge_width,
+        owns_figure = ax is None
+        if owns_figure:
+            fig, ax = plt.subplots(
+                figsize=figsize or self.style.figsize,
+                dpi=dpi or self.style.dpi,
+                facecolor=self.style.background,
             )
         else:
-            edge_colors = [intraclass_edge_color] * g_ig.ecount()
-            edge_widths = [intraclass_edge_width] * g_ig.ecount()
+            fig = ax.figure
+            fig.set_facecolor(self.style.background)
 
-        fig_dpi = dpi if dpi is not None else self.style.dpi
-        fig_size = figsize or self.style.figsize or (9, 9)
-
-        fig, ax = plt.subplots(1, 1, figsize=fig_size, dpi=fig_dpi)
-        ax.axis("off")
-        ax.set_aspect("equal")
-
-        ig.plot(
-            g_ig,
-            target=ax,
-            layout=lay,
-            bbox=self.style.bbox,
-            margin=self.style.margin,
-            vertex_color=vertex_colors,
-            vertex_size=vertex_sizes,
-            vertex_label=labels,
-            vertex_label_size=self.style.label_size,
-            edge_color=edge_colors,
-            edge_width=edge_widths,
+        color_map = self._class_colors(labels)
+        effective_edge_alpha = (
+            edge_alpha
+            if edge_alpha is not None
+            else self.style.class_edge_alpha
+            if class_id is not None and self.style.class_edge_alpha is not None
+            else self.style.edge_alpha
+        )
+        effective_community_distance = (
+            community_distance if community_distance is not None else self.style.community_distance
+        )
+        Graph(
+            graph_nx,
+            **self._graph_kwargs(
+                graph_nx,
+                labels,
+                node_layout=active_node_layout,
+                edge_layout=active_edge_layout,
+                class_id=class_id,
+                show_interclass_edges=show_interclass_edges and class_id is None,
+                edge_alpha=effective_edge_alpha,
+                community_distance=effective_community_distance,
+                node_positions=node_positions,
+                ax=ax,
+            ),
         )
 
-        if self.style.add_titles:
-            ax.set_title(title, fontsize=11)
+        self._add_legend(ax, color_map, labels, class_id)
+        default_title = None if class_id is None else f"Class {class_id}"
+        self._finish_axes(ax, title if title is not None else default_title)
+        if owns_figure:
+            fig.tight_layout(pad=0.2)
 
-        plt.tight_layout()
-        if save_path:
-            fig.savefig(save_path, dpi=fig_dpi, bbox_inches="tight")
+        if save_path is not None:
+            fig.savefig(save_path, dpi=dpi or self.style.dpi, bbox_inches="tight", facecolor=fig.get_facecolor())
 
         return fig, ax
+
+    def plot_class(self, graph: AttributedGraph, class_id: int, **kwargs):
+        return self.plot_scatt_graph(graph, class_id=class_id, **kwargs)
 
     def generate_and_plot_scatt(
         self,
@@ -1038,757 +640,8 @@ class graphPlotter:
         plot_kwargs: Optional[Dict[str, Any]] = None,
         **generate_kwargs,
     ):
-        """
-        Gera um grafo com SCAttGenerator.generate(...) e plota em seguida.
-
-        Exemplo:
-            graph, fig, ax = graphPlotter().generate_and_plot_scatt(
-                seed=2026,
-                num_nodes=sum(y),
-                y=y,
-                k=len(y),
-                e=e,
-                C=C,
-                d=["power_law", "normal", "uniform"],
-                rho=0.08,
-                N=N,
-                M=M,
-            )
-        """
         from models.SCatt import SCAttGenerator
 
         graph = SCAttGenerator(seed=seed).generate(**generate_kwargs)
         fig, ax = self.plot_scatt_graph(graph, **(plot_kwargs or {}))
         return graph, fig, ax
-
-    # ----------------------------
-    # Compare subgrafo a subgrafo entre vários grafos
-    # ----------------------------
-    def compare_graphs_subgraphs(
-        self,
-        graphs: Sequence[AttributedGraph],
-        *,
-        which: str = "all",                 # "all" | "one" | "subset"
-        graph_index: int = 0,               # usado quando which="one"
-        graph_indices: Optional[Sequence[int]] = None,  # usado quando which="subset"
-        subgraph_ids: Optional[Sequence[int]] = None,   # colunas específicas (classes específicas)
-        layout: Optional[Union[str, ig.Layout]] = None,
-        colors: Optional[Sequence[str]] = None,         # cores por COLUNA (subgrafo)
-        show_labels: Optional[bool] = None,
-        save_path: Optional[str] = None,
-        dpi: Optional[int] = None,
-        figsize: Optional[Tuple[float, float]] = None,
-        titles: Optional[Sequence[str]] = None,         # títulos por linha (grafo)
-        empty_cell_text: str = "vazio",
-    ):
-        """
-        Compara subgrafos entre grafos:
-        - Linhas = grafos
-        - Colunas = subgraph_id (classe)
-
-        which:
-          - "all": usa todos os grafos na lista
-          - "one": usa somente graphs[graph_index]
-          - "subset": usa apenas graphs[graph_indices]
-        """
-
-        if len(graphs) == 0:
-            raise ValueError("Lista 'graphs' vazia.")
-
-        which = which.lower().strip()
-        if which not in {"all", "one", "subset"}:
-            raise ValueError("which deve ser 'all', 'one' ou 'subset'.")
-
-        # Seleciona quais grafos entram
-        if which == "all":
-            selected = list(range(len(graphs)))
-        elif which == "one":
-            if not (0 <= graph_index < len(graphs)):
-                raise IndexError(f"graph_index={graph_index} fora do intervalo 0..{len(graphs)-1}")
-            selected = [graph_index]
-        else:  # subset
-            if not graph_indices:
-                raise ValueError("Para which='subset', forneça graph_indices=[...].")
-            selected = list(graph_indices)
-            for gi in selected:
-                if not (0 <= gi < len(graphs)):
-                    raise IndexError(f"graph_indices contém {gi} fora do intervalo 0..{len(graphs)-1}")
-
-        selected_graphs = [graphs[i] for i in selected]
-        print([i.graph.numberOfNodes() for i in selected_graphs])
-
-        # Define quais subgraph_ids (colunas) entram:
-        # - se o usuário não passou, pega a união das chaves de subgraphs de todos os grafos selecionados
-        if subgraph_ids is None:
-            union_ids = set()
-            for g in selected_graphs:
-                if not hasattr(g, "subgraphs"):
-                    raise ValueError("Algum AttributedGraph não tem atributo 'subgraphs'. Rode create_subgraphs().")
-                union_ids.update(g.subgraphs.keys())
-            col_ids = sorted(union_ids)
-        else:
-            col_ids = list(subgraph_ids)
-
-        nrows = len(selected_graphs)
-        ncols = len(col_ids)
-        if ncols == 0:
-            raise ValueError("Nenhum subgraph_id para plotar (col_ids está vazio).")
-
-        # Cores por COLUNA (subgrafo)
-        palette = list(colors) if colors is not None else list(self.style.subgraph_colors)
-        if len(palette) == 0:
-            palette = [self.style.default_vertex_color]
-
-        fig_dpi = dpi if dpi is not None else self.style.dpi
-        if figsize is None:
-            # uma regra simples: ~4.2 por coluna, ~4.2 por linha
-            fig_size = self.style.figsize or (4.2 * ncols, 4.2 * nrows)
-        else:
-            fig_size = figsize
-
-        fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=fig_size, dpi=fig_dpi)
-        if nrows == 1 and ncols == 1:
-            axes_grid = [[axes]]
-        elif nrows == 1:
-            axes_grid = [list(axes)]
-        elif ncols == 1:
-            axes_grid = [[ax] for ax in axes]
-        else:
-            axes_grid = [list(row) for row in axes]
-
-        # Plot célula por célula: (grafo i, subgrafo j)
-        for r, att in enumerate(selected_graphs):
-            # título da linha (grafo)
-            row_title = None
-            if titles is not None and r < len(titles):
-                row_title = titles[r]
-            else:
-                row_title = f"Grafo {selected[r]}"
-
-            for c, sub_id in enumerate(col_ids):
-                ax = axes_grid[r][c]
-
-                if not hasattr(att, "subgraphs") or att.subgraphs is None:
-                    raise ValueError("Algum AttributedGraph não tem 'subgraphs'. Rode create_subgraphs().")
-
-                if sub_id not in att.subgraphs:
-                    # célula vazia: não existe esse subgrafo nesse grafo
-                    ax.axis("off")
-                    ax.text(
-                        0.5, 0.5, empty_cell_text,
-                        ha="center", va="center", fontsize=11
-                    )
-                    # coloca título na coluna mesmo assim, se for primeira linha
-                    if self.style.add_titles and r == 0:
-                        ax.set_title(f"{self.style.title_prefix} {sub_id}", fontsize=11)
-                    continue
-
-                sg_nk = att.subgraphs[sub_id]
-                g_ig, _, new_to_old = nk_to_igraph_remap(sg_nk)
-
-                lay = self._resolve_layout(g_ig, layout=layout)
-                sizes = self._sizes_from_degree(g_ig)
-                labels = self._labels_from_mapping(g_ig, new_to_old, show_labels=show_labels)
-
-                col_color = palette[c % len(palette)]
-                # Título: na primeira linha, título da coluna; na primeira coluna, “marca” a linha
-                title = None
-                if self.style.add_titles and r == 0:
-                    title = f"{self.style.title_prefix} {sub_id}"
-
-                self._plot_one(ax, g_ig, lay, col_color, sizes, labels, title)
-
-                # “rótulo” da linha na primeira coluna (fica na lateral esquerda)
-                if c == 0:
-                    ax.text(
-                        -0.02, 0.5, row_title,
-                        transform=ax.transAxes,
-                        rotation=90,
-                        va="center", ha="right",
-                        fontsize=11
-                    )
-
-        plt.tight_layout()
-        if save_path:
-            fig.savefig(save_path, dpi=fig_dpi, bbox_inches="tight")
-
-        return fig, axes
-
-    def plot_degree_distributions(
-        self,
-        attGraph: AttributedGraph,
-        *,
-        include_full: bool = True,
-        subgraph_ids: Optional[Sequence[int]] = None,
-        which: str = "all",          # "all" | "one"
-        subgraph_id: Optional[int] = None,  # usado quando which="one"
-        pmf: bool = True,            # True: P(k); False: contagem
-        bins: Optional[int] = None,  # se None, usa bins automáticos por grau inteiro
-        loglog: bool = False,
-        density: Optional[bool] = None,  # se None, segue pmf; se bool, força
-        save_path: Optional[str] = None,
-        dpi: int = 300,
-        figsize: Optional[Tuple[float, float]] = None,
-        title_full: str = "Grafo completo",
-        title_prefix: str = "Subgrafo",
-        grid: Optional[Tuple[int, int]] = None,
-        linewidth: float = 1.8,
-        alpha: float = 0.9,
-    ):
-        """
-        Plota distribuição de grau (grafo completo + subgrafos) usando NetworKit para graus.
-
-        - pmf=True: plota P(k) (probabilidade)
-        - pmf=False: plota contagem de nós com grau k
-
-        loglog=True plota em escala log-log (muito útil p/ caudas).
-        """
-
-        if density is None:
-            density = pmf
-
-        # --------- Seleciona quais subgrafos vão entrar ---------
-        if not hasattr(attGraph, "subgraphs") or attGraph.subgraphs is None:
-            raise ValueError("attGraph.subgraphs não existe. Rode create_subgraphs() antes.")
-
-        all_sub_ids = sorted(attGraph.subgraphs.keys())
-
-        if which.lower().strip() == "one":
-            if subgraph_id is None:
-                raise ValueError("which='one' exige subgraph_id=...")
-            if subgraph_id not in attGraph.subgraphs:
-                raise ValueError(f"subgraph_id={subgraph_id} não existe em attGraph.subgraphs.")
-            chosen_sub_ids = [subgraph_id]
-        else:
-            if subgraph_ids is None:
-                chosen_sub_ids = all_sub_ids
-            else:
-                chosen_sub_ids = [sid for sid in subgraph_ids if sid in attGraph.subgraphs]
-
-        # Lista de grafos para plotar
-        items: List[Tuple[str, nk.Graph]] = []
-        if include_full:
-            items.append((title_full, attGraph.graph))
-
-        for sid in chosen_sub_ids:
-            items.append((f"{title_prefix} {sid}", attGraph.subgraphs[sid]))
-
-        if len(items) == 0:
-            raise ValueError("Nada para plotar: include_full=False e nenhum subgrafo selecionado.")
-
-        # --------- Funções auxiliares ---------
-        def degree_array(g: nk.Graph) -> np.ndarray:
-            # graus via NetworKit
-            return np.array([g.degree(u) for u in g.iterNodes()], dtype=int)
-
-        def degree_hist(deg: np.ndarray):
-            """
-            Retorna (k_vals, y_vals) onde:
-            - k_vals = graus
-            - y_vals = contagem ou pmf
-            """
-            if deg.size == 0:
-                return np.array([], dtype=int), np.array([], dtype=float)
-
-            kmax = int(deg.max())
-            counts = np.bincount(deg, minlength=kmax + 1)
-
-            k_vals = np.arange(len(counts), dtype=int)
-            y_vals = counts.astype(float)
-
-            if density:  # normaliza para probabilidade
-                total = y_vals.sum()
-                if total > 0:
-                    y_vals = y_vals / total
-
-            # remove k onde y = 0 (melhor para loglog)
-            mask = y_vals > 0
-            return k_vals[mask], y_vals[mask]
-
-        # --------- Layout de subplots ---------
-        n_plots = len(items)
-        if grid is None:
-            ncols = math.ceil(math.sqrt(n_plots))
-            nrows = math.ceil(n_plots / ncols)
-        else:
-            nrows, ncols = grid
-
-        if figsize is None:
-            figsize = (4.8 * ncols, 4.2 * nrows)
-
-        fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize, dpi=dpi)
-        if isinstance(axes, plt.Axes):
-            axes_list = [axes]
-        else:
-            axes_list = list(axes.flatten())
-
-        # desliga eixos extras
-        for ax in axes_list[n_plots:]:
-            ax.axis("off")
-
-        # --------- Plota cada distribuição ---------
-        for i, (title, g_nk) in enumerate(items):
-            ax = axes_list[i]
-            deg = degree_array(g_nk)
-            k, y = degree_hist(deg)
-
-            # caso grafo vazio
-            if k.size == 0:
-                ax.axis("off")
-                ax.set_title(title)
-                ax.text(0.5, 0.5, "vazio", ha="center", va="center")
-                continue
-
-            # Desenho como “linha com marcadores” (bom para comparar caudas)
-            ax.plot(k, y, marker="o", linewidth=linewidth, alpha=alpha)
-
-            ax.set_title(title)
-            ax.set_xlabel("grau k")
-            ax.set_ylabel("P(k)" if density else "contagem")
-
-            if loglog:
-                ax.set_xscale("log")
-                ax.set_yscale("log")
-
-            ax.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.4)
-
-        plt.tight_layout()
-
-        if save_path:
-            fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
-
-        return fig, axes
-    
-
-    def compare_graph_metrics(
-        self,
-        graphs: Sequence["AttributedGraph"],
-        *,
-        names: Optional[Sequence[str]] = None,
-        reference_index: int = 0,
-        compute_modularity: bool = True,
-        community_iters: int = 10,
-        compute_ks_degree: bool = True,
-    ) -> pd.DataFrame:
-        """
-        Compara N grafos (AttributedGraph) e retorna um DataFrame com métricas.
-
-        graphs: lista de AttributedGraph
-        names: nomes opcionais (mesmo tamanho de graphs). Se None: "G0", "G1", ...
-        reference_index: índice do grafo de referência para KS da NDD (default 0)
-        compute_modularity: roda PLM e computa modularidade
-        community_iters: iterações do PLM (tradeoff qualidade/tempo)
-        compute_ks_degree: computa KS da distribuição de grau vs. referência (PMF acumulada)
-        """
-
-        if len(graphs) == 0:
-            raise ValueError("graphs está vazio.")
-
-        if names is None:
-            names = [f"G{i}" for i in range(len(graphs))]
-        if len(names) != len(graphs):
-            raise ValueError("names deve ter o mesmo tamanho que graphs.")
-
-        if not (0 <= reference_index < len(graphs)):
-            raise IndexError("reference_index fora do intervalo.")
-
-        # ---------- helpers ----------
-        def density(n: int, m: int) -> float:
-            if n <= 1:
-                return 0.0
-            return (2.0 * m) / (n * (n - 1))
-
-        def degree_array(g: nk.Graph) -> np.ndarray:
-            return np.fromiter((g.degree(u) for u in g.iterNodes()), dtype=np.int64, count=g.numberOfNodes())
-
-        def degree_entropy(deg: np.ndarray) -> float:
-            # entropia de P(k)
-            if deg.size == 0:
-                return 0.0
-            counts = np.bincount(deg)
-            p = counts[counts > 0].astype(float)
-            p /= p.sum()
-            return float(-(p * np.log(p)).sum())
-
-        def homophily_fraction(g: nk.Graph, y: torch.Tensor) -> Tuple[float, float]:
-            # fração de arestas intra-classe vs inter-classe
-            if y is None:
-                return (float("nan"), float("nan"))
-            if y.numel() == 0 or g.numberOfEdges() == 0:
-                return (0.0, 0.0)
-
-            same = 0
-            total = 0
-            # y pode estar em GPU; traga pra CPU p/ indexação rápida
-            y_cpu = y.detach().cpu()
-            for u, v in g.iterEdges():
-                total += 1
-                if y_cpu[u].item() == y_cpu[v].item():
-                    same += 1
-            if total == 0:
-                return (0.0, 0.0)
-            homo = same / total
-            hetero = 1.0 - homo
-            return (homo, hetero)
-
-        def largest_cc_fraction(g: nk.Graph) -> Tuple[int, float]:
-            # n_components e fração LCC
-            if g.numberOfNodes() == 0:
-                return 0, 0.0
-            cc = nk.components.ConnectedComponents(g)
-            cc.run()
-            comps = cc.getComponents()
-            n_comp = len(comps)
-            lcc = max((len(c) for c in comps), default=0)
-            return n_comp, (lcc / g.numberOfNodes())
-
-        def avg_local_clustering(g: nk.Graph) -> float:
-            if g.numberOfNodes() == 0:
-                return 0.0
-            lcc = nk.centrality.LocalClusteringCoefficient(g)
-            lcc.run()
-            scores = lcc.scores()
-            return float(np.mean(scores)) if len(scores) else 0.0
-
-        def degree_assortativity(g: nk.Graph) -> float:
-            """
-            Assortatividade por grau (Newman) para grafo não-direcionado.
-            Implementação manual para evitar dependência de API específica do NetworKit.
-            """
-            m = g.numberOfEdges()
-            if m == 0:
-                return float("nan")
-
-            deg = degree_array(g).astype(float)
-
-            # Para cada aresta, pegue (j,k) = graus dos endpoints
-            js = []
-            ks = []
-            for u, v in g.iterEdges():
-                js.append(deg[u])
-                ks.append(deg[v])
-
-            j = np.array(js, dtype=float)
-            k = np.array(ks, dtype=float)
-
-            # Newman (2002): r = [E[jk] - E[(j+k)/2]^2] / [E[(j^2+k^2)/2] - E[(j+k)/2]^2]
-            ejk = np.mean(j * k)
-            e1 = np.mean((j + k) / 2.0)
-            e2 = np.mean((j**2 + k**2) / 2.0)
-
-            num = ejk - e1**2
-            den = e2 - e1**2
-            if den == 0:
-                return float("nan")
-            return float(num / den)
-
-        def community_metrics_plm(g: nk.Graph) -> Dict[str, Any]:
-            if g.numberOfNodes() == 0 or g.numberOfEdges() == 0:
-                return {
-                    "modularity": float("nan"),
-                    "n_communities": 0,
-                    "community_size_mean": 0.0,
-                    "community_size_std": 0.0,
-                    "community_size_entropy": 0.0,
-                }
-
-            # PLM: bom custo/benefício
-            plm = nk.community.PLM(g, refine=True)
-            plm.run()
-            part = plm.getPartition()
-
-            # modularidade
-            mod = nk.community.Modularity().getQuality(part, g)
-
-            # tamanhos das comunidades
-            sizes = part.subsetSizeMap()  # dict {comm_id: size}
-            sz = np.array(list(sizes.values()), dtype=float)
-            if sz.size == 0:
-                return {
-                    "modularity": float(mod),
-                    "n_communities": 0,
-                    "community_size_mean": 0.0,
-                    "community_size_std": 0.0,
-                    "community_size_entropy": 0.0,
-                }
-
-            p = sz / sz.sum()
-            ent = float(-(p * np.log(p)).sum()) if p.size else 0.0
-
-            return {
-                "modularity": float(mod),
-                "n_communities": int(sz.size),
-                "community_size_mean": float(sz.mean()),
-                "community_size_std": float(sz.std(ddof=0)),
-                "community_size_entropy": ent,
-            }
-
-        def cdf_from_degree_pmf(deg: np.ndarray) -> np.ndarray:
-            if deg.size == 0:
-                return np.array([1.0], dtype=float)
-            counts = np.bincount(deg)
-            pmf = counts.astype(float)
-            s = pmf.sum()
-            if s > 0:
-                pmf /= s
-            return np.cumsum(pmf)
-
-        def ks_distance_degree(deg_a: np.ndarray, deg_b: np.ndarray) -> float:
-            cdf_a = cdf_from_degree_pmf(deg_a)
-            cdf_b = cdf_from_degree_pmf(deg_b)
-            L = max(len(cdf_a), len(cdf_b))
-            if len(cdf_a) < L:
-                cdf_a = np.pad(cdf_a, (0, L - len(cdf_a)), mode="edge")
-            if len(cdf_b) < L:
-                cdf_b = np.pad(cdf_b, (0, L - len(cdf_b)), mode="edge")
-            return float(np.max(np.abs(cdf_a - cdf_b)))
-
-        # ---------- referência para KS ----------
-        ref_deg = degree_array(graphs[reference_index].graph) if compute_ks_degree else None
-
-        rows: List[Dict[str, Any]] = []
-
-        for idx, (name, ag) in enumerate(zip(names, graphs)):
-            g = ag.graph
-            n = g.numberOfNodes()
-            m = g.numberOfEdges()
-
-            deg = degree_array(g) if n > 0 else np.array([], dtype=np.int64)
-
-            avg_deg = float((2.0 * m / n) if n > 0 else 0.0)
-            var_deg = float(np.var(deg)) if deg.size else 0.0
-            ent_deg = degree_entropy(deg)
-
-            n_comp, lcc_frac = largest_cc_fraction(g)
-            clust = avg_local_clustering(g)
-            assort = degree_assortativity(g)
-
-            # homofilia por rótulo (se tiver)
-            if ag.y is not None and isinstance(ag.y, torch.Tensor):
-                homo, hetero = homophily_fraction(g, ag.y)
-            else:
-                homo, hetero = (float("nan"), float("nan"))
-
-            # modularidade e comunidades
-            comm = {}
-            if compute_modularity:
-                comm = community_metrics_plm(g)
-            else:
-                comm = {
-                    "modularity": float("nan"),
-                    "n_communities": 0,
-                    "community_size_mean": float("nan"),
-                    "community_size_std": float("nan"),
-                    "community_size_entropy": float("nan"),
-                }
-
-            # KS vs referência
-            ks_deg = float("nan")
-            if compute_ks_degree and ref_deg is not None:
-                ks_deg = ks_distance_degree(deg, ref_deg)
-
-            rows.append({
-                "name": name,
-                "n_nodes": int(n),
-                "n_edges": int(m),
-                "density": float(density(n, m)),
-                "avg_degree": avg_deg,
-                "var_degree": var_deg,
-                "degree_entropy": ent_deg,
-                "n_components": int(n_comp),
-                "lcc_fraction": float(lcc_frac),
-                "avg_local_clustering": float(clust),
-                "degree_assortativity": float(assort),
-                "label_homophily": float(homo),
-                "label_heterophily": float(hetero),
-                "ks_degree_to_ref": float(ks_deg),
-                **comm,
-            })
-
-        df = pd.DataFrame(rows)
-
-        # Coloca "name" como primeira coluna e ordena colunas principais
-        col_order = [
-            "name",
-            "n_nodes", "n_edges", "density",
-            "avg_degree", "var_degree", "degree_entropy",
-            "n_components", "lcc_fraction",
-            "avg_local_clustering", "degree_assortativity",
-            "modularity", "n_communities", "community_size_mean", "community_size_std", "community_size_entropy",
-            "label_homophily", "label_heterophily",
-            "ks_degree_to_ref",
-        ]
-        # mantém extras caso algo apareça no futuro
-        df = df[[c for c in col_order if c in df.columns] + [c for c in df.columns if c not in col_order]]
-
-        return df
-    
-    def plot_full_graph_with_subgraph_layout(
-    self,
-    attGraph: AttributedGraph,
-    *,
-    subgraph_ids: Optional[Sequence[int]] = None,
-    layout: Optional[Union[str, ig.Layout]] = "fr",   # layout interno de cada subgrafo
-    grid: Optional[Tuple[int, int]] = None,
-    block_gap: float = 3.0,
-    normalize_each_block: bool = True,
-    color_by_label: bool = True,
-    show_labels: Optional[bool] = False,
-
-    # ---- NOVOS CONTROLES VISUAIS ----
-    interclass_edge_color: str = "#D9D9D9",  # bem claro
-    interclass_edge_width: float = 0.35,
-    intraclass_edge_width: float = 0.9,
-    vertex_size_range: Tuple[float, float] = (10.0, 36.0),  # vértices maiores
-    # ---------------------------------
-
-    save_path: Optional[str] = None,
-    dpi: Optional[int] = None,
-    figsize: Optional[Tuple[float, float]] = None,
-    title: str = "Grafo completo (layout reaproveitado dos subgrafos)",
-    ):
-        if not hasattr(attGraph, "subgraphs") or attGraph.subgraphs is None:
-            raise ValueError("attGraph.subgraphs não existe. Rode create_subgraphs() antes.")
-
-        # quais subgrafos entram
-        all_ids = sorted(attGraph.subgraphs.keys())
-        if subgraph_ids is None:
-            sub_ids = all_ids
-        else:
-            sub_ids = [sid for sid in subgraph_ids if sid in attGraph.subgraphs]
-        if len(sub_ids) == 0:
-            raise ValueError("Nenhum subgrafo selecionado para compor o layout.")
-
-        # ---------- converter grafo completo ----------
-        g_full_nk = attGraph.graph
-        g_full_ig, old_to_new_full, new_to_old_full = nk_to_igraph_remap(g_full_nk)
-        n_full = g_full_ig.vcount()
-
-        # ---------- define grid ----------
-        k = len(sub_ids)
-        if grid is None:
-            ncols = math.ceil(math.sqrt(k))
-            nrows = math.ceil(k / ncols)
-        else:
-            nrows, ncols = grid
-
-        coords_full = np.zeros((n_full, 2), dtype=float)
-        positioned = np.zeros(n_full, dtype=bool)
-
-        palette = list(self.style.subgraph_colors) if self.style.subgraph_colors else [self.style.default_vertex_color]
-
-        # ---------- layout por bloco ----------
-        block_index = 0
-        for sid in sub_ids:
-            sg_nk = attGraph.subgraphs[sid]
-            sg_ig, _, new_to_old_sg = nk_to_igraph_remap(sg_nk)
-
-            lay_sg = self._resolve_layout(sg_ig, layout=layout)
-            xy = np.array(lay_sg.coords, dtype=float)
-
-            if normalize_each_block and xy.shape[0] > 0:
-                xy = xy - xy.mean(axis=0, keepdims=True)
-                max_abs = np.max(np.abs(xy))
-                if max_abs > 0:
-                    xy = xy / max_abs  # ~[-1,1]
-
-            r = block_index // ncols
-            c = block_index % ncols
-            offset = np.array([c * block_gap, -r * block_gap], dtype=float)
-            xy = xy + offset
-
-            for v in sg_ig.vs:
-                old_id = new_to_old_sg[v.index]
-                new_id_full = old_to_new_full[old_id]
-                coords_full[new_id_full] = xy[v.index]
-                positioned[new_id_full] = True
-
-            block_index += 1
-
-        # nós não posicionados (se existirem)
-        if not positioned.all():
-            last_r = (block_index - 1) // ncols
-            last_c = (block_index - 1) % ncols
-            base = np.array([last_c * block_gap, -last_r * block_gap], dtype=float) + np.array([block_gap, 0.0])
-            missing = np.where(~positioned)[0]
-            for t, vid in enumerate(missing):
-                coords_full[vid] = base + np.array([0.25 * (t % 10), -0.25 * (t // 10)])
-
-        layout_full = ig.Layout(coords_full.tolist())
-
-        # ---------- cores por nó ----------
-        if color_by_label and hasattr(attGraph, "y") and attGraph.y is not None:
-            y_cpu = attGraph.y.detach().cpu().numpy()
-            vcolors = []
-            for v in g_full_ig.vs:
-                old_id = new_to_old_full[v.index]
-                c = int(y_cpu[old_id])
-                vcolors.append(palette[c % len(palette)])
-        else:
-            vcolors = self.style.default_vertex_color
-            y_cpu = None  # para não usar nas arestas
-
-        # ---------- cores e larguras por aresta ----------
-        # intraclasse = cor da classe; interclasse = cinza claro
-        edge_colors = []
-        edge_widths = []
-
-        if y_cpu is not None:
-            for e in g_full_ig.es:
-                u_new, v_new = e.tuple
-                u_old = new_to_old_full[u_new]
-                v_old = new_to_old_full[v_new]
-
-                cu = int(y_cpu[u_old])
-                cv = int(y_cpu[v_old])
-
-                if cu == cv:
-                    edge_colors.append(palette[cu % len(palette)])
-                    edge_widths.append(intraclass_edge_width)
-                else:
-                    edge_colors.append(interclass_edge_color)
-                    edge_widths.append(interclass_edge_width)
-        else:
-            # sem y: tudo igual
-            edge_colors = ["#C0C0C0"] * g_full_ig.ecount()
-            edge_widths = [interclass_edge_width] * g_full_ig.ecount()
-
-        # ---------- tamanhos dos nós (maiores) ----------
-        old_vs = self.style.vertex_size_range
-        self.style.vertex_size_range = vertex_size_range
-        sizes = self._sizes_from_degree(g_full_ig)
-        self.style.vertex_size_range = old_vs
-
-        labels = self._labels_from_mapping(g_full_ig, new_to_old_full, show_labels=show_labels)
-
-        # ---------- plot ----------
-        fig_dpi = dpi if dpi is not None else self.style.dpi
-        if figsize is None:
-            figsize = (12, 12)
-
-        fig, ax = plt.subplots(1, 1, figsize=figsize, dpi=fig_dpi)
-        ax.axis("off")
-        ax.set_aspect("equal")
-
-        ig.plot(
-            g_full_ig,
-            target=ax,
-            layout=layout_full,
-            bbox=self.style.bbox,
-            margin=self.style.margin,
-            vertex_color=vcolors,
-            vertex_size=sizes,
-            vertex_label=labels,
-            vertex_label_size=self.style.label_size,
-            edge_color=edge_colors,
-            edge_width=edge_widths,
-        )
-
-        if self.style.add_titles:
-            ax.set_title(title, fontsize=11)
-
-        plt.tight_layout()
-        if save_path:
-            fig.savefig(save_path, dpi=fig_dpi, bbox_inches="tight")
-
-        return fig, ax

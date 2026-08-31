@@ -51,18 +51,18 @@ def main():
 
                         # 3) gera o grafo com rho atual
                         G = SCAttGenerator(seed = 2026).generate(
-                            num_nodes=args.num_nodes,
+                            n=args.n,
                             e=torch.tensor(args.num_edges),
                             y=args.y,
                             k=args.k,
-                            C=[torch.tensor(x) for x in args.C],
-                            d=args.d,
+                            A_in=[torch.tensor(x) for x in args.A_in],
+                            dst=args.dst,
                             rho=rho_value,
-                            alpha = aa,
-                            sigma = ll,
-                            N=torch.tensor(args.N),
-                            M=[torch.tensor(x) for x in args.M],
-                            dimensions=args.dimensions
+                            alpha_topo=aa,
+                            alpha_feat=ll,
+                            A_out=torch.tensor(args.A_out),
+                            S=[torch.tensor(x) for x in args.S],
+                            d=args.d
                         )
 
                         dt = G.to_data_pytorch()
@@ -79,14 +79,13 @@ def main():
                         if isinstance(out, dict) and "model" in out and out["model"] is not None:
                             save_model(out["model"], exp_dir, exc, rho_value)
                         else:
-                            # fallback: se sua função ainda não retorna o modelo
                             # (a gente vai ajustar depois no train_gae_kmeans_nmi)
                             pass
 
                         # 7) adiciona resultados ao dataframe
                         df = append_result(df, out, dt, exc, rho_value, ll, aa)
 
-                        print(f"[exc={exc}] rho={rho_value} nmi={out['nmi']}, lambda={ll}, alpha={aa}")
+                        print(f"[exc={exc}] rho={rho_value} nmi={out['nmi']}, alpha_feat={ll}, alpha_topo={aa}")
 
                         # 9) salva métricas no final
                         save_metrics(df, exp_dir)
@@ -213,18 +212,18 @@ def main():
                 y = torch.tensor([int(args.default_node_values / sum(list(range(1,num_com+1)))) * index for index in range(1,num_com+1)][::-1])
                 e = torch.tensor([val*4 if val >= 1000 else val*3 if 500 < val < 1000 else int(val*2.5) for val in y])
                 k= len(y)
-                d = [euristic_distribution(x) for x in y]
-                C = [euristic_subcomm_interaction(x) for x in y]
-                M = [euristic_subcomm_prob(x) for x in y]
+                dst = [euristic_distribution(x) for x in y]
+                A_in = [euristic_subcomm_interaction(x) for x in y]
+                S = [euristic_subcomm_prob(x) for x in y]
 
-                N = torch.ones(size = (len(y), len(y))) - torch.eye(n = len(y))
+                A_out = torch.ones(size = (len(y), len(y))) - torch.eye(n = len(y))
 
                 path = f"experiments/DGCluster_SCAtt_datasets/SCAtt_numcom_{len(y)}.pt"
 
                 if os.path.exists(path):
                     print(f"Skipping, graph alredy exists in {path}")
                 else:
-                    graph = SCAttGenerator().generate(num_nodes=y.sum().item(), y = y, k = k, e = e, C = C, d = d, rho = 0.001, N = N, M = M, alpha_powerlaw=1.3, dimensions = 256, alpha = 0.5, sigma = 0.3)
+                    graph = SCAttGenerator().generate(n=y.sum().item(), y=y, k=k, e=e, A_in=A_in, dst=dst, rho=int(e.sum().item() * 1.2), A_out=A_out, S=S, alpha_powerlaw=1.3, d=256, alpha_topo=0.5, alpha_feat=0.3)
                     dt = graph.to_data_pytorch()
                     torch.save(dt, path)
 

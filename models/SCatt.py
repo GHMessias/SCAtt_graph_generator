@@ -11,6 +11,7 @@ from scipy.stats import rankdata
 
 from typing import List, Sequence, Any, Optional, Dict
 import math
+import warnings
 
 def compact_graph_ids(g: nk.Graph):
     """
@@ -112,28 +113,28 @@ def split_by_class_and_partitions(
 
     return result
 
-def distribution_transform(d: str, n: int, alpha: float = 2.0, seed=None,
-                           mu=None, sigma=None, eps: float = 1e-6):
+def distribution_transform(dst: str, n: int, powerlaw_exponent: float = 2.0, seed=None,
+                           mu=None, normal_std=None, eps: float = 1e-6):
 
     ranks = torch.arange(1, n + 1, dtype=torch.float64)
 
-    if d == 'power_law':
-        w = ranks ** (-alpha)
+    if dst == 'power_law':
+        w = ranks ** (-powerlaw_exponent)
 
-    elif d == 'normal':
+    elif dst == 'normal':
         # centro e dispersão "compatíveis" com ranks 1..n
         if mu is None:
             mu = (n + 1) / 2.0
-        if sigma is None:
-            sigma = max(n / 6.0, 1.0)  # regra prática: cobre bem o intervalo
+        if normal_std is None:
+            normal_std = max(n / 6.0, 1.0)  # regra prática: cobre bem o intervalo
 
-        w = torch.exp(- (ranks - mu) ** 2 / (2 * sigma ** 2))
+        w = torch.exp(- (ranks - mu) ** 2 / (2 * normal_std ** 2))
 
-    elif d == 'uniform':
+    elif dst == 'uniform':
         w = torch.ones(n, dtype=torch.float64)
 
     else:
-        raise ValueError(f"Distribuição desconhecida: {d}")
+        raise ValueError(f"Distribuição desconhecida: {dst}")
 
     # suavização para evitar concentração absurda / underflow
     w = w + eps
@@ -175,14 +176,14 @@ def _sample_index(weights: torch.Tensor) -> int:
 
 
 def _prepare_partition_matrix(matrix, num_partitions: int, label: int) -> torch.Tensor:
-    matrix = _to_float_tensor(matrix, f"C[{label}]")
+    matrix = _to_float_tensor(matrix, f"A_in[{label}]")
 
     if matrix.ndim == 1 and num_partitions == 1 and matrix.numel() == 1:
         matrix = matrix.reshape(1, 1)
 
     if matrix.ndim != 2 or tuple(matrix.shape) != (num_partitions, num_partitions):
         raise ValueError(
-            f"C[{label}] deve ter shape ({num_partitions}, {num_partitions}); "
+            f"A_in[{label}] deve ter shape ({num_partitions}, {num_partitions}); "
             f"recebido {tuple(matrix.shape)}."
         )
 
@@ -235,17 +236,17 @@ class graphPartition:
 
     def compute_partition_heterogeneity(self):
         '''
-        Essa função calcula a probabilidade de uma aresta ser intra-partição e inter-partição, para cada uma das partições. A saída dela é uma matriz C onde C_{i,j} representa a probabilidade da partição i ser ligada na partição j
+        Essa função calcula a probabilidade de uma aresta ser intra-partição e inter-partição, para cada uma das partições. A saída dela é uma matriz A_in onde A_in_{i,j} representa a probabilidade da partição i ser ligada na partição j
         
         :param self: Description
         '''
 
-        self.C = torch.zeros((self._number_of_partitions(), self._number_of_partitions()))
+        self.A_in = torch.zeros((self._number_of_partitions(), self._number_of_partitions()))
 
         for u,v in self.subgraph.iterEdges():
             # print(self._get_partition(u), self._get_partition(v))
-            self.C[self._get_partition(u), self._get_partition(v)] += 1
-            self.C[self._get_partition(v), self._get_partition(u)] += 1
+            self.A_in[self._get_partition(u), self._get_partition(v)] += 1
+            self.A_in[self._get_partition(v), self._get_partition(u)] += 1
         return
 
     def compute_partition_probability(self):
@@ -265,45 +266,89 @@ class SCAttGenerator(BaseGenerator):
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-    def _validate_generate_inputs(self, num_nodes, y, k, e, C, d, rho, N, M):
+    def _validate_generate_inputs(
+        self,
+        n,
+        y,
+        k,
+        e,
+        A_in,
+        dst,
+        rho,
+        A_out,
+        S,
+    ):
         y = _to_int_list(y, "y")
         e = _to_int_list(e, "e")
 
-        if num_nodes != sum(y):
-            raise ValueError(f"num_nodes deve ser igual a sum(y). num_nodes={num_nodes}, sum(y)={sum(y)}")
+        if n != sum(y):
+            raise ValueError(f"n deve ser igual a sum(y). n={n}, sum(y)={sum(y)}")
         if k != len(y):
             raise ValueError(f"k deve ser igual a len(y). k={k}, len(y)={len(y)}")
         if len(e) != k:
             raise ValueError(f"e deve ter tamanho k. len(e)={len(e)}, k={k}")
-        if len(d) != k:
-            raise ValueError(f"d deve ter tamanho k. len(d)={len(d)}, k={k}")
-        if len(M) != k:
-            raise ValueError(f"M deve ter tamanho k. len(M)={len(M)}, k={k}")
-        if len(C) != k:
-            raise ValueError(f"C deve ter tamanho k. len(C)={len(C)}, k={k}")
+        if dst is None:
+            raise ValueError("dst deve ser informado.")
+        if len(dst) != k:
+            raise ValueError(f"dst deve ter tamanho k. len(dst)={len(dst)}, k={k}")
+        if A_in is None:
+            raise ValueError("A_in deve ser informado.")
+        if S is None:
+            raise ValueError("S deve ser informado.")
+        if A_out is None:
+            raise ValueError("A_out deve ser informado.")
+        if len(S) != k:
+            raise ValueError(f"S deve ter tamanho k. len(S)={len(S)}, k={k}")
+        if len(A_in) != k:
+            raise ValueError(f"A_in deve ter tamanho k. len(A_in)={len(A_in)}, k={k}")
+        if rho is None:
+            raise ValueError("rho deve ser informado.")
+        if isinstance(rho, torch.Tensor):
+            if rho.numel() != 1:
+                raise ValueError("rho deve ser um unico valor inteiro.")
+            rho = rho.item()
+        if isinstance(rho, bool):
+            raise ValueError("rho deve ser um inteiro representando o numero total de arestas.")
+
+        try:
+            rho_value = float(rho)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("rho deve ser um inteiro representando o numero total de arestas.") from exc
+        if not rho_value.is_integer():
+            raise ValueError("rho deve ser um inteiro representando o numero total de arestas.")
+
+        rho = int(rho_value)
         if rho < 0:
             raise ValueError("rho deve ser maior ou igual a zero.")
 
-        M = [_to_float_tensor(m, f"M[{label}]").view(-1) for label, m in enumerate(M)]
-        for label, m in enumerate(M):
-            if m.numel() == 0 or m.sum() <= 0:
-                raise ValueError(f"M[{label}] deve conter pelo menos um peso positivo.")
+        max_total_edges = n * (n - 1) // 2
+        if rho > max_total_edges:
+            raise ValueError(
+                f"rho={rho} excede o maximo de arestas simples para {n} nos ({max_total_edges})."
+            )
+        if rho < sum(e):
+            raise ValueError(f"rho={rho} deve ser maior ou igual a sum(e)={sum(e)}.")
 
-        C = [
-            _prepare_partition_matrix(C[label], num_partitions=len(M[label]), label=label)
+        S = [_to_float_tensor(s, f"S[{label}]").view(-1) for label, s in enumerate(S)]
+        for label, s in enumerate(S):
+            if s.numel() == 0 or s.sum() <= 0:
+                raise ValueError(f"S[{label}] deve conter pelo menos um peso positivo.")
+
+        A_in = [
+            _prepare_partition_matrix(A_in[label], num_partitions=len(S[label]), label=label)
             for label in range(k)
         ]
 
-        N = _to_float_tensor(N, "N")
-        if tuple(N.shape) != (k, k):
-            raise ValueError(f"N deve ter shape ({k}, {k}); recebido {tuple(N.shape)}.")
-        if not torch.all(torch.diagonal(N) == 0):
-            raise ValueError("A diagonal da matriz N deve ser zero.")
+        A_out = _to_float_tensor(A_out, "A_out")
+        if tuple(A_out.shape) != (k, k):
+            raise ValueError(f"A_out deve ter shape ({k}, {k}); recebido {tuple(A_out.shape)}.")
+        if not torch.all(torch.diagonal(A_out) == 0):
+            raise ValueError("A diagonal da matriz A_out deve ser zero.")
 
-        return y, e, C, N, M
+        return y, e, A_in, A_out, S, rho
 
-    def _sample_target_partition(self, C: torch.Tensor, src_partition: int) -> int:
-        row = C[src_partition].float()
+    def _sample_target_partition(self, A_in: torch.Tensor, src_partition: int) -> int:
+        row = A_in[src_partition].float()
         if row.sum() <= 0:
             return src_partition
         return _sample_index(row)
@@ -312,6 +357,9 @@ class SCAttGenerator(BaseGenerator):
         isolated_nodes = [u for u in graph.iterNodes() if graph.degree(u) == 0]
 
         for u in isolated_nodes:
+            if graph.degree(u) > 0:
+                continue
+
             all_nodes = torch.tensor(list(graph.iterNodes()), dtype=torch.long)
             same_class = all_nodes[(y[all_nodes] == y[u]) & (all_nodes != u)]
 
@@ -319,10 +367,10 @@ class SCAttGenerator(BaseGenerator):
                 degrees = torch.tensor([graph.degree(nd.item()) for nd in same_class]).float()
                 v = same_class[_sample_index(degrees)].item()
             else:
-                fallback = all_nodes[all_nodes != u]
-                if len(fallback) == 0:
+                other_nodes = all_nodes[all_nodes != u]
+                if len(other_nodes) == 0:
                     continue
-                v = fallback[torch.randint(len(fallback), (1,))].item()
+                v = other_nodes[torch.randint(len(other_nodes), (1,))].item()
 
             if not graph.hasEdge(u, v):
                 graph.addEdge(u, v)
@@ -333,16 +381,16 @@ class SCAttGenerator(BaseGenerator):
             return torch.zeros((0, 0), dtype=torch.float)
 
         matrix_size = int(valid_labels.max().item()) + 1
-        N = torch.zeros((matrix_size, matrix_size), dtype=torch.float)
+        A_out = torch.zeros((matrix_size, matrix_size), dtype=torch.float)
 
         for u, v in graph.iterEdges():
             cu = int(y[u])
             cv = int(y[v])
             if cu >= 0 and cv >= 0 and cu != cv:
-                N[cu, cv] += 1
-                N[cv, cu] += 1
+                A_out[cu, cv] += 1
+                A_out[cv, cu] += 1
 
-        return N
+        return A_out
 
     def _subgraphs_by_label(self, attributed_graph: AttributedGraph) -> dict[int, nk.Graph]:
         subgraphs = {}
@@ -354,54 +402,77 @@ class SCAttGenerator(BaseGenerator):
             subgraphs[label] = nk.graphtools.subgraphAndNeighborsFromNodes(attributed_graph.graph, nodes=nodes)
         return subgraphs
 
-    def _add_heterogeneous_edges_until_density(
-        self,
-        graph: nk.Graph,
-        y: torch.Tensor,
-        target_density: float,
-        N: torch.Tensor,
-        max_attempts_factor: int = 200,
-    ):
-        actual_density = nk.graphtools.density(graph)
-        if actual_density >= target_density:
-            return
+    def _count_heterogeneous_edges(self, graph: nk.Graph, y: torch.Tensor) -> int:
+        return sum(1 for u, v in graph.iterEdges() if int(y[u]) >= 0 and int(y[v]) >= 0 and int(y[u]) != int(y[v]))
 
+    def _interclass_sampling_context(self, graph: nk.Graph, y: torch.Tensor, A_out: torch.Tensor):
         valid_nodes = [u for u in graph.iterNodes() if int(y[u]) >= 0]
         labels = sorted({int(y[u]) for u in valid_nodes})
         if len(labels) < 2:
-            return
+            return labels, {}, torch.zeros((0, 0), dtype=torch.float), 0
 
         class_nodes = {label: [u for u in valid_nodes if int(y[u]) == label] for label in labels}
-        matrix_size = max(max(labels) + 1, N.shape[0])
-        N_eff = torch.zeros((matrix_size, matrix_size), dtype=torch.float)
-        N_eff[: N.shape[0], : N.shape[1]] = N.float()
-        N_eff.fill_diagonal_(0)
+        matrix_size = max(max(labels) + 1, A_out.shape[0])
+        A_out_eff = torch.zeros((matrix_size, matrix_size), dtype=torch.float)
+        A_out_eff[: A_out.shape[0], : A_out.shape[1]] = A_out.float()
+        A_out_eff.fill_diagonal_(0)
 
-        if N_eff.sum() <= 0:
+        if A_out_eff.sum() <= 0:
             for src in labels:
                 for tgt in labels:
                     if src != tgt:
-                        N_eff[src, tgt] = 1
+                        A_out_eff[src, tgt] = 1
+
+        return labels, class_nodes, A_out_eff, matrix_size
+
+    def _add_heterogeneous_edges_until_count(
+        self,
+        graph: nk.Graph,
+        y: torch.Tensor,
+        target_hetero_edges: int,
+        A_out: torch.Tensor,
+        max_attempts_factor: int = 200,
+        error_context: str = "rho",
+    ):
+        current_hetero_edges = self._count_heterogeneous_edges(graph, y)
+        if current_hetero_edges >= target_hetero_edges:
+            return
+
+        labels, class_nodes, A_out_eff, matrix_size = self._interclass_sampling_context(graph, y, A_out)
+        if len(labels) < 2:
+            return
+
+        max_hetero_edges = 0
+        for src_pos, src in enumerate(labels):
+            for tgt in labels[src_pos + 1:]:
+                max_hetero_edges += len(class_nodes[src]) * len(class_nodes[tgt])
+
+        if target_hetero_edges > max_hetero_edges:
+            raise ValueError(
+                f"{error_context} exige {target_hetero_edges} arestas heterogeneas, "
+                f"mas a capacidade maxima com os nos atuais e {max_hetero_edges}."
+            )
 
         attempts = 0
-        max_attempts = max(1, graph.upperEdgeIdBound() + graph.numberOfNodes()) * max_attempts_factor
+        missing_edges = target_hetero_edges - current_hetero_edges
+        max_attempts = max(1_000, missing_edges * max_attempts_factor)
 
-        while nk.graphtools.density(graph) < target_density:
+        while current_hetero_edges < target_hetero_edges:
             attempts += 1
             if attempts > max_attempts:
                 raise RuntimeError(
-                    "Nao foi possivel atingir rho com a matriz N informada. "
+                    f"Nao foi possivel atingir {error_context} com a matriz A_out informada. "
                     "Verifique se ha pares de classes disponiveis para novas arestas heterogeneas."
                 )
 
             source_weights = torch.zeros(matrix_size, dtype=torch.float)
             for label in labels:
-                source_weights[label] = N_eff[label].sum()
+                source_weights[label] = A_out_eff[label].sum()
 
             community_u = _sample_index(source_weights)
             target_weights = torch.zeros(matrix_size, dtype=torch.float)
             for label in labels:
-                target_weights[label] = N_eff[community_u, label]
+                target_weights[label] = A_out_eff[community_u, label]
 
             if target_weights.sum() <= 0:
                 continue
@@ -420,22 +491,48 @@ class SCAttGenerator(BaseGenerator):
 
             if u != v and not graph.hasEdge(u, v):
                 graph.addEdge(u, v)
+                current_hetero_edges += 1
 
-    def _generate_attributes(self, graph: nk.Graph, y: torch.Tensor, dimensions: int, sigma: float, alpha: float):
+    def _add_heterogeneous_edges_until_density(
+        self,
+        graph: nk.Graph,
+        y: torch.Tensor,
+        target_density: float,
+        A_out: torch.Tensor,
+        max_attempts_factor: int = 200,
+    ):
+        actual_density = nk.graphtools.density(graph)
+        if actual_density >= target_density:
+            return
+
+        max_possible_edges = graph.numberOfNodes() * (graph.numberOfNodes() - 1) // 2
+        target_total_edges = math.ceil(target_density * max_possible_edges)
+        missing_edges = target_total_edges - graph.numberOfEdges()
+        target_hetero_edges = self._count_heterogeneous_edges(graph, y) + missing_edges
+        self._add_heterogeneous_edges_until_count(
+            graph=graph,
+            y=y,
+            target_hetero_edges=target_hetero_edges,
+            A_out=A_out,
+            max_attempts_factor=max_attempts_factor,
+            error_context="rho",
+        )
+
+    def _generate_attributes(self, graph: nk.Graph, y: torch.Tensor, d: int, alpha_feat: float, alpha_topo: float):
         labels = sorted(int(label) for label in torch.unique(y[y >= 0]).tolist())
         k = len(labels)
-        if dimensions < k:
-            raise ValueError(f"dimensions deve ser >= numero de classes. dimensions={dimensions}, classes={k}")
+        if d < k:
+            raise ValueError(f"d deve ser >= numero de classes. d={d}, classes={k}")
 
-        A = np.random.randn(dimensions, k)
+        A = np.random.randn(d, k)
         Q, _ = np.linalg.qr(A)
         prototypes = Q[:, :k].T
         label_to_prototype = {label: idx for idx, label in enumerate(labels)}
 
-        x0 = np.zeros(shape=(graph.numberOfNodes(), dimensions))
+        x0 = np.zeros(shape=(graph.numberOfNodes(), d))
         for nd in range(graph.numberOfNodes()):
             prototype_idx = label_to_prototype[int(y[nd])]
-            x0[nd] = prototypes[prototype_idx] + sigma * np.random.normal(size=(dimensions))
+            x0[nd] = prototypes[prototype_idx] + alpha_feat * np.random.normal(size=(d))
 
         neighbor_sum = np.zeros_like(x0)
         for u, v in graph.iterEdges():
@@ -448,7 +545,7 @@ class SCAttGenerator(BaseGenerator):
         degree_scale[mask] = degrees[mask] ** (-0.5)
 
         smoothed = degree_scale[:, None] * neighbor_sum
-        x = alpha * x0 + (1 - alpha) * smoothed
+        x = alpha_topo * x0 + (1 - alpha_topo) * smoothed
         return torch.tensor(x)
 
     def rank_based_matching(self, base_graph: AttributedGraph, mimic_graph: nk.Graph, noise_mean: float = 0, noise_std: float = 1):
@@ -531,8 +628,8 @@ class SCAttGenerator(BaseGenerator):
                 # Partição 
                 src_partition = prt._get_partition(u)
 
-                # Escolho em C algum vértice para ligar u
-                tgt_partition = self._sample_target_partition(prt.C, src_partition)
+                # Escolho em A_in algum vértice para ligar u
+                tgt_partition = self._sample_target_partition(prt.A_in, src_partition)
 
                 # Seleciono algum vértice v de acordo com a probabilidade de ligação dos vértices em tgt_partition
                 tmp_deg = {node:sub_g.degree(node) for node in prt.graph_partitions[tgt_partition]}
@@ -553,7 +650,7 @@ class SCAttGenerator(BaseGenerator):
             graph=graph,
             y=y,
             target_density=aim_density,
-            N=interclass_matrix,
+            A_out=interclass_matrix,
         )
 
 
@@ -614,7 +711,7 @@ class SCAttGenerator(BaseGenerator):
                     n_nodes_v_i = 1
 
                 for _ in range(n_nodes_v_i):
-                    row = _global_partitions[c_i].C[src_partition]
+                    row = _global_partitions[c_i].A_in[src_partition]
                     if torch.sum(row) == 0:
                         tgt_partition = src_partition
                     else:
@@ -630,8 +727,8 @@ class SCAttGenerator(BaseGenerator):
                         v_j = _global_partitions[c_i].graph_partitions[tgt_partition][v_j]
                         if v_i != v_j:
                             graph.addEdge(v_i,v_j)
-                            _global_partitions[c_i].C[src_partition, tgt_partition] += 1
-                            _global_partitions[c_i].C[tgt_partition, src_partition] += 1
+                            _global_partitions[c_i].A_in[src_partition, tgt_partition] += 1
+                            _global_partitions[c_i].A_in[tgt_partition, src_partition] += 1
                             continue_add = False
 
             # Adicionar Ruído
@@ -639,54 +736,78 @@ class SCAttGenerator(BaseGenerator):
                 graph=attGraph.graph,
                 y=attGraph.y,
                 target_density=nk.graphtools.density(base_graph.graph),
-                N=interclass_matrix,
+                A_out=interclass_matrix,
             )
 
         # REMOVE IF THERE WAS AN ERROR
         attGraph.create_subgraphs()
         return attGraph
     
-    def _run_scatt(self, num_nodes: int, y: list[int], k: int, e: list[int], C: list[torch.tensor], d: list[str], rho: float, N: torch.tensor, M: list[torch.tensor], sigma = 1, dimensions = 10, alpha = 0.8, alpha_powerlaw = 2, sigma_distribution = None, mu_distribution = None, eps = 1e-6):
+    def _run_scatt(
+        self,
+        n: int,
+        y: list[int],
+        k: int,
+        e: list[int],
+        A_in: list[torch.tensor],
+        dst: list[str],
+        rho: int,
+        A_out: torch.tensor = None,
+        S: list[torch.tensor] = None,
+        alpha_feat=1,
+        d: int = 10,
+        alpha_topo=0.8,
+        alpha_powerlaw=2,
+        std_distribution=None,
+        mu_distribution=None,
+        eps=1e-6,
+    ):
         '''
 
-        :param num_nodes: number of nodes for the graph
-        :type num_nodes: int
+        :param n: number of nodes for the graph
+        :type n: int
         :param y: list of number of nodes for each class, i.e, y[1] is a int that represents the number of nodes in class 1
         :type y: list[int]
         :param k: number of classes. len(y) == k
         :type k: int
-        :param e: list of number of edges for each class. 
+        :param e: list of number of homogeneous edges for each class.
         :type e: list[int]
-        :param C: list of torch.tensor elements. Each element in C represents the distribution probability for connection between the partitions. As every class has different number of partitions, C can have tensors with different shapes.
-        :type C: list[torch.tensor]
-        :param d: list of strings that represents the distributions of each class. The available distributions are: TODO
-        :type d: list[str]
-        :param rho: density value of the model. The density will guide the number of total edges, since the edges added to reach the target density are all heterogeneous (between different classes).
-        :type density: float
-        :param N: torch.tensor that represents the probability assignment of edges between classes.
-        :type N: torch.tensor
-        :param M: torch.tensor that represents the number of element in each partition
-        :type: list[torch.tensor]
+        :param A_in: list of torch.tensor elements. Each element represents the connection probabilities between sub-communities inside one class.
+        :type A_in: list[torch.tensor]
+        :param dst: list of strings that represents the node degree distributions of each class.
+        :type dst: list[str]
+        :param rho: total number of edges in the graph.
+        :type rho: int
+        :param A_out: torch.tensor that represents the edge allocation weights between classes.
+        :type A_out: torch.tensor
+        :param S: list of tensors representing the relative size of each sub-community.
+        :type S: list[torch.tensor]
+        :param d: dimension of the feature matrix X.
+        :type d: int
+        :param alpha_feat: Gaussian feature perturbation strength.
+        :type alpha_feat: float
+        :param alpha_topo: trade-off between class-conditioned attributes and topological smoothing.
+        :type alpha_topo: float
         '''
 
-        y, e, C, N, M = self._validate_generate_inputs(
-            num_nodes=num_nodes,
+        y, e, A_in, A_out, S, rho = self._validate_generate_inputs(
+            n=n,
             y=y,
             k=k,
             e=e,
-            C=C,
-            d=d,
+            A_in=A_in,
+            dst=dst,
             rho=rho,
-            N=N,
-            M=M,
+            A_out=A_out,
+            S=S,
         )
 
-        tmp_graph = nk.Graph(num_nodes, weighted = False, directed = False)
+        tmp_graph = nk.Graph(n, weighted = False, directed = False)
         tmp_y = torch.tensor([i for i, v in enumerate(y) for _ in range(v)], dtype=torch.long)
 
         # Atribuir cada um dos vértices de cada grupo a cada partição
 
-        out = split_by_class_and_partitions(n = num_nodes, y = y, parts=[x.tolist() for x in M])
+        out = split_by_class_and_partitions(n = n, y = y, parts=[x.tolist() for x in S])
         for label, label_num_nodes in enumerate(y):
             max_edges = label_num_nodes * (label_num_nodes - 1) // 2
             if e[label] > max_edges:
@@ -697,17 +818,17 @@ class SCAttGenerator(BaseGenerator):
 
             distributions = []
             partition_sizes = torch.tensor([len(partition) for partition in out[label]], dtype=torch.float)
-            for ptt in range(len(M[label])):
+            for ptt in range(len(S[label])):
                 if len(out[label][ptt]) == 0:
                     distributions.append(torch.empty(0))
                     continue
                 distributions.append(
                     distribution_transform(
-                        d=d[label],
+                        dst=dst[label],
                         n=len(out[label][ptt]),
-                        alpha=alpha_powerlaw,
+                        powerlaw_exponent=alpha_powerlaw,
                         mu=mu_distribution,
-                        sigma=sigma_distribution,
+                        normal_std=std_distribution,
                         eps=eps,
                     )
                 )
@@ -715,7 +836,7 @@ class SCAttGenerator(BaseGenerator):
             added_edges = 0
             attempts = 0
             max_attempts = max(1_000, e[label] * 200)
-            src_partition_weights = M[label].float().clone()
+            src_partition_weights = S[label].float().clone()
             src_partition_weights[partition_sizes == 0] = 0
 
             if src_partition_weights.sum() <= 0 and e[label] > 0:
@@ -726,11 +847,11 @@ class SCAttGenerator(BaseGenerator):
                 if attempts > max_attempts:
                     raise RuntimeError(
                         f"Nao foi possivel criar e[{label}]={e[label]} arestas na classe {label}. "
-                        "Verifique C, M e o numero de nos por subcomunidade."
+                        "Verifique A_in, S e o numero de nos por subcomunidade."
                     )
 
                 src_partition = _sample_index(src_partition_weights)
-                target_weights = C[label][src_partition].float().clone()
+                target_weights = A_in[label][src_partition].float().clone()
                 target_weights[partition_sizes == 0] = 0
 
                 if target_weights.sum() <= 0:
@@ -760,28 +881,27 @@ class SCAttGenerator(BaseGenerator):
                     tmp_graph.addEdge(u,v)
                     added_edges += 1
 
-        # removing isolated nodes
-        isolated_nodes = [u for u in tmp_graph.iterNodes() if tmp_graph.degree(u) == 0]
+        self._connect_isolated_nodes(tmp_graph, tmp_y)
+        if tmp_graph.numberOfEdges() > rho:
+            warnings.warn(
+                f"Ao conectar vertices isolados, o grafo passou a ter {tmp_graph.numberOfEdges()} arestas, "
+                f"mas rho={rho}. O grafo sera retornado com mais arestas que o valor solicitado.",
+                RuntimeWarning,
+            )
 
-        isolated_nodes = torch.tensor(isolated_nodes, dtype=torch.long)
-
-        mask = torch.ones(tmp_y.size(0), dtype=torch.bool)
-        mask[isolated_nodes] = False
-
-        # tmp_y = tmp_y[mask]
-        tmp_y[~mask] = -1
-
-        for node in isolated_nodes:
-            tmp_graph.removeNode(node)
-
-        # print(f'tamanho do y {tmp_y.shape}, numero de vértices {tmp_graph.numberOfNodes()}')
-
-        self._add_heterogeneous_edges_until_density(
+        missing_edges = max(0, rho - tmp_graph.numberOfEdges())
+        target_hetero_edges = self._count_heterogeneous_edges(tmp_graph, tmp_y) + missing_edges
+        self._add_heterogeneous_edges_until_count(
             graph=tmp_graph,
             y=tmp_y,
-            target_density=rho,
-            N=N,
+            target_hetero_edges=target_hetero_edges,
+            A_out=A_out,
         )
+        if tmp_graph.numberOfEdges() != rho:
+            warnings.warn(
+                f"O grafo gerado possui {tmp_graph.numberOfEdges()} arestas, mas rho={rho}.",
+                RuntimeWarning,
+            )
 
         # TESTE REMOVENDO OS VÉRTICES E REINDEXANDO
         tmp_graph = compact_graph_ids(tmp_graph)
@@ -793,15 +913,50 @@ class SCAttGenerator(BaseGenerator):
         x = self._generate_attributes(
             graph=tmp_graph,
             y=tmp_y,
-            dimensions=dimensions,
-            sigma=sigma,
-            alpha=alpha,
+            d=d,
+            alpha_feat=alpha_feat,
+            alpha_topo=alpha_topo,
         )
 
         return  AttributedGraph(graph = tmp_graph, y = tmp_y, x = x)
 
-    def generate(self, num_nodes: int, y: list[int], k: int, e: list[int], C: list[torch.tensor], d: list[str], rho: float, N: torch.tensor, M: list[torch.tensor], sigma = 1, dimensions = 10, alpha = 0.8, alpha_powerlaw = 2, sigma_distribution = None, mu_distribution = None, eps = 1e-6):
-        return self._run_scatt(num_nodes=num_nodes, y=y, k=k, e=e, C=C, d=d, rho=rho, N=N, M=M, sigma=sigma, dimensions = dimensions, alpha = alpha, alpha_powerlaw=alpha_powerlaw, sigma_distribution=sigma_distribution, mu_distribution=mu_distribution, eps = eps)
+    def generate(
+        self,
+        n: int,
+        y: list[int],
+        k: int,
+        e: list[int],
+        A_in: list[torch.tensor],
+        dst: list[str],
+        rho: int,
+        A_out: torch.tensor = None,
+        S: list[torch.tensor] = None,
+        alpha_feat=1,
+        d: int = 10,
+        alpha_topo=0.8,
+        alpha_powerlaw=2,
+        std_distribution=None,
+        mu_distribution=None,
+        eps=1e-6,
+    ):
+        return self._run_scatt(
+            n=n,
+            y=y,
+            k=k,
+            e=e,
+            A_in=A_in,
+            dst=dst,
+            rho=rho,
+            A_out=A_out,
+            S=S,
+            alpha_feat=alpha_feat,
+            d=d,
+            alpha_topo=alpha_topo,
+            alpha_powerlaw=alpha_powerlaw,
+            std_distribution=std_distribution,
+            mu_distribution=mu_distribution,
+            eps=eps,
+        )
     
 
     def prepare_inductive_mimic_data(

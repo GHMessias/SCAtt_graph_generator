@@ -58,36 +58,36 @@ No modo `generate`, os principais parametros sao:
 
 | Parametro | Descricao |
 | --- | --- |
-| `num_nodes` | Numero total de nos. Deve ser igual a `sum(y)`. |
+| `n` | Numero total de nos. Deve ser igual a `sum(y)`. |
 | `k` | Numero de comunidades/classes. Deve ser igual a `len(y)`. |
 | `y` | Quantidade de nos por comunidade. Ex.: `[40, 40, 40]`. |
 | `e` | Numero de arestas homogeneas por comunidade. |
-| `d` | Distribuicao de grau por comunidade: `"power_law"`, `"normal"` ou `"uniform"`. |
-| `M` | Vetores com a proporcao de nos em cada subcomunidade de cada classe. |
-| `C` | Matrizes de interacao entre subcomunidades dentro de cada classe. |
-| `N` | Matriz de interacao entre comunidades diferentes. A diagonal deve ser zero. |
-| `rho` | Densidade alvo usada para adicionar arestas heterogeneas/ruido topologico. |
-| `dimensions` | Dimensao da matriz de atributos `X`. |
-| `sigma` | Intensidade do ruido gaussiano nos atributos. No artigo, corresponde ao parametro lambda. |
-| `alpha` | Peso entre atributos de classe e suavizacao topologica. |
-| `alpha_powerlaw` | Expoente usado quando `d="power_law"`. |
+| `dst` | Distribuicao de grau por comunidade: `"power_law"`, `"normal"` ou `"uniform"`. |
+| `S` | Vetores com a proporcao de nos em cada subcomunidade de cada classe. |
+| `A_in` | Matrizes de interacao entre subcomunidades dentro de cada classe. |
+| `A_out` | Matriz de interacao entre comunidades diferentes. A diagonal deve ser zero. |
+| `rho` | Numero total de arestas do grafo. Deve ser um inteiro maior ou igual a `sum(e)`. |
+| `d` | Dimensao da matriz de atributos `X`. |
+| `alpha_feat` | Intensidade do ruido gaussiano nos atributos. |
+| `alpha_topo` | Peso entre atributos de classe e suavizacao topologica. |
+| `alpha_powerlaw` | Expoente usado quando `dst="power_law"`. |
 
-### Interpretacao de `M`, `C` e `N`
+### Interpretacao de `S`, `A_in` e `A_out`
 
-`M` define o tamanho relativo das subcomunidades. Por exemplo:
+`S` define o tamanho relativo das subcomunidades. Por exemplo:
 
 ```python
-M = [
+S = [
     torch.tensor([1.0]),              # classe 0: uma subcomunidade
     torch.tensor([0.4, 0.3, 0.3]),    # classe 1: tres subcomunidades
     torch.tensor([0.9, 0.1]),         # classe 2: duas subcomunidades
 ]
 ```
 
-`C` define como essas subcomunidades se conectam dentro da mesma classe. Cada `C[c]` deve ser uma matriz quadrada com tamanho igual ao numero de subcomunidades de `M[c]`.
+`A_in` define como essas subcomunidades se conectam dentro da mesma classe. Cada `A_in[c]` deve ser uma matriz quadrada com tamanho igual ao numero de subcomunidades de `S[c]`.
 
 ```python
-C = [
+A_in = [
     torch.tensor([[1.0]]),
     torch.tensor([
         [0.6, 0.3, 0.1],
@@ -103,11 +103,13 @@ C = [
 
 Na geracao de arestas homogeneas, o SCAtt agora usa:
 
-1. `M[c]` para escolher a subcomunidade de origem;
-2. a linha `C[c][origem, :]` para escolher a subcomunidade de destino;
-3. `d[c]` para escolher os nos dentro das subcomunidades.
+1. `S[c]` para escolher a subcomunidade de origem;
+2. a linha `A_in[c][origem, :]` para escolher a subcomunidade de destino;
+3. `dst[c]` para escolher os nos dentro das subcomunidades.
 
-`N` controla o ruido entre comunidades. A entrada `N[i, j]` indica a tendencia de criar uma aresta heterogenea entre as classes `i` e `j`.
+`A_out` controla o ruido entre comunidades. A entrada `A_out[i, j]` indica a tendencia ou quantidade relativa de arestas heterogeneas entre as classes `i` e `j`.
+
+O numero de arestas heterogeneas e calculado por `rho - sum(e)`. Assim, `e` controla as arestas internas de cada comunidade, enquanto `A_out` controla como as arestas entre comunidades sao distribuidas.
 
 ## Exemplo minimo
 
@@ -120,13 +122,13 @@ y = [40, 40, 40]
 e = [150, 200, 100]
 k = len(y)
 
-M = [
+S = [
     torch.tensor([1.0]),
     torch.tensor([0.4, 0.3, 0.3]),
     torch.tensor([0.9, 0.1]),
 ]
 
-C = [
+A_in = [
     torch.tensor([[1.0]]),
     torch.tensor([
         [0.6, 0.3, 0.1],
@@ -139,25 +141,25 @@ C = [
     ]),
 ]
 
-N = torch.tensor([
+A_out = torch.tensor([
     [0.0, 0.2, 0.8],
     [0.3, 0.0, 0.7],
     [0.5, 0.5, 0.0],
 ])
 
 graph = SCAttGenerator(seed=2026).generate(
-    num_nodes=sum(y),
+    n=sum(y),
     y=y,
     k=k,
     e=e,
-    C=C,
-    d=["power_law", "normal", "uniform"],
-    rho=0.08,
-    N=N,
-    M=M,
-    dimensions=60,
-    sigma=0.3,
-    alpha=0.5,
+    A_in=A_in,
+    dst=["power_law", "normal", "uniform"],
+    rho=600,
+    A_out=A_out,
+    S=S,
+    d=60,
+    alpha_feat=0.3,
+    alpha_topo=0.5,
 )
 
 print(graph)
@@ -175,37 +177,74 @@ plotter = graphPlotter()
 fig, ax = plotter.plot_scatt_graph(
     graph,
     layout="community",
-    keep="all",
-    community_halos=True,
-    highlight_interclass_edges=True,
-    vertex_size_range=(180, 620),
+    edge_layout="bundled",
+    edge_alpha=0.08,
+    community_distance=1.35,
     save_path="scatt_graph.png",
 )
 ```
 
-O `layout="community"` usa os rotulos `y` para iniciar o desenho de forma organizada, mas ainda roda um layout de forca global para que comunidades conectadas fiquem mais proximas. Para um layout sem usar rotulos, use `layout="spring"`. Para o desenho antigo em blocos separados, use `layout="community_blocks"`. Para comparar com o render antigo baseado em igraph, use `backend="igraph"`.
-
-Para uma figura mais apropriada para artigo, use o backend `netgraph`:
+Para plotar somente uma classe:
 
 ```python
-fig, ax = plotter.plot_scatt_graph(
+fig, ax = plotter.plot_class(
     graph,
-    backend="netgraph",
-    layout="community",
-    netgraph_edge_layout="bundled",
-    netgraph_bundle_k=2000,
-    vertex_size_range=(120, 360),
-    node_edge_width=0,
-    edge_alpha=0.10,
+    class_id=1,
+    save_path="scatt_class_1.png",
+)
+```
+
+O plot novo usa `netgraph` para renderizar uma visualizacao limpa para artigo. Por padrao, o grafo completo usa `layout="community"` para organizar os vertices por rotulo e `edge_layout="bundled"` para agrupar visualmente as arestas. Arestas dentro da mesma classe recebem a cor da classe; arestas entre classes ficam pretas. Para visualizacoes sem usar rotulos, use `layout="spring"`.
+
+Para ajustar o estilo da figura:
+
+```python
+from plot.plot import PublicationPlotStyle, graphPlotter
+
+style = PublicationPlotStyle(
     figsize=(7.2, 6.2),
+    edge_alpha=0.12,
+    community_distance=1.35,
+    edge_bundle_k=2000,
+)
+
+fig, ax = graphPlotter(style).plot_scatt_graph(
+    graph,
+    layout="community",
+    edge_layout="bundled",
     save_path="scatt_publication.png",
 )
 ```
 
-Esse estilo segue o exemplo do Netgraph: cores por comunidade, borda do vertice removida e arestas agrupadas. Se ficar lento em grafos maiores, troque `netgraph_edge_layout="bundled"` por `"curved"`. O backend `netgraph` requer:
+Para comparar varios grafos mantendo os vertices no mesmo lugar, calcule as posicoes uma vez e reutilize em todos os paineis:
 
-```bash
-pip install netgraph
+```python
+import matplotlib.pyplot as plt
+
+from plot.plot import PublicationPlotStyle, graphPlotter
+
+graphs = [graph_600_100, graph_450_250, graph_300_400, graph_150_550]
+titles = ["600 intra / 100 inter", "450 intra / 250 inter", "300 intra / 400 inter", "150 intra / 550 inter"]
+
+plotter = graphPlotter(PublicationPlotStyle(node_size=0.8, edge_alpha=0.06))
+node_positions = plotter.get_node_positions(
+    graphs[0],
+    layout="community",
+    community_distance=1.35,
+)
+
+fig, axes = plt.subplots(1, 4, figsize=(14, 3.6), dpi=300)
+for ax, graph_i, title in zip(axes, graphs, titles):
+    plotter.plot_scatt_graph(
+        graph_i,
+        ax=ax,
+        node_positions=node_positions,
+        edge_layout="bundled",
+        title=title,
+    )
+
+fig.tight_layout()
+fig.savefig("scatt_heterogeneous_control.png", bbox_inches="tight")
 ```
 
 Tambem e possivel gerar e plotar em uma chamada:
@@ -215,23 +254,22 @@ from plot.plot import graphPlotter
 
 graph, fig, ax = graphPlotter().generate_and_plot_scatt(
     seed=2026,
-    num_nodes=sum(y),
+    n=sum(y),
     y=y,
     k=k,
     e=e,
-    C=C,
-    d=["power_law", "normal", "uniform"],
-    rho=0.08,
-    N=N,
-    M=M,
-    dimensions=60,
-    sigma=0.3,
-    alpha=0.5,
+    A_in=A_in,
+    dst=["power_law", "normal", "uniform"],
+    rho=600,
+    A_out=A_out,
+    S=S,
+    d=60,
+    alpha_feat=0.3,
+    alpha_topo=0.5,
     plot_kwargs={
         "save_path": "scatt_graph.png",
         "layout": "community",
-        "community_halos": True,
-        "highlight_interclass_edges": True,
+        "edge_layout": "bundled",
     },
 )
 ```
@@ -283,12 +321,12 @@ Este repositorio nao possui um arquivo de dependencias fixado. Pelos imports do 
 - `scikit-learn`
 - `pandas`
 - `matplotlib`
+- `networkx`
+- `netgraph`
 - `seaborn`
 - `powerlaw` para `analysis/sfanalysis.py`
 
 ## Observacoes
 
 - O grafo e nao direcionado e nao ponderado.
-- Nos isolados podem ser removidos no modo `generate`, seguindo o fluxo descrito no artigo antes da reindexacao.
-- A diagonal de `N` deve ser zero, pois arestas homogeneas sao controladas por `e`, `M`, `C` e `d`.
-- `sigma` no codigo corresponde ao parametro lambda de dispersao dos atributos descrito no artigo.
+- A diagonal de `A_out` deve ser zero, pois arestas homogeneas sao controladas por `e`, `S`, `A_in` e `dst`.

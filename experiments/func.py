@@ -30,21 +30,21 @@ def arguments():
     # ======================
     # MODELO BASE (fixo)
     # ======================
-    parser.add_argument("--num_nodes", type = int, default = 120, help = "number of nodes for the graph benchmark")
+    parser.add_argument("--n", type = int, default = 120, help = "number of nodes for the graph benchmark")
     parser.add_argument("--num_edges", type = int, nargs="+", default = [150, 200, 100], help = "number of edges for each class")
     parser.add_argument("--k", type = int, default = 3, help = "number of classes for the graph benchmark")
     parser.add_argument("--y", type = int, nargs= "+", default = [40,40,40], help = "list that represents the number of elements in each class.")
-    parser.add_argument("--C", type = float, nargs = "+", default = [[1],
+    parser.add_argument("--A_in", type = float, nargs = "+", default = [[1],
                                                                      [[0.6, 0.3, 0.1],
                                                                       [0.1, 0.7, 0.2],
                                                                       [0.0, 0.3, 0.7]],
                                                                      [[0.9,0.1],
                                                                       [0.1,0.9]]])
-    parser.add_argument("--d", type = str, nargs = "+", default = ["power_law", "normal", "uniform"])
-    parser.add_argument("--N", type = float, nargs = "+", default = [[0, 0.2, 0.8], [0.3, 0, 0.7], [0.5, 0.5, 0]])
-    parser.add_argument("--rho", type = float, default = 0.08, help = "desired density for graph generation")
-    parser.add_argument("--M", type = float, nargs = "+", default = [[1], [0.4,0.3,0.3], [0.9,0.1]])
-    parser.add_argument("--dimensions", type = int, default = 60)
+    parser.add_argument("--dst", type = str, nargs = "+", default = ["power_law", "normal", "uniform"])
+    parser.add_argument("--A_out", type = float, nargs = "+", default = [[0, 0.2, 0.8], [0.3, 0, 0.7], [0.5, 0.5, 0]])
+    parser.add_argument("--rho", type = int, default = 600, help = "total number of edges for graph generation")
+    parser.add_argument("--S", type = float, nargs = "+", default = [[1], [0.4,0.3,0.3], [0.9,0.1]])
+    parser.add_argument("--d", type = int, default = 60)
 
     # ======================
     # SELETOR DE EXPERIMENTO
@@ -69,9 +69,9 @@ def arguments():
     # ======================
     parser.add_argument(
         "--rho_list",
-        type=float,
+        type=int,
         nargs="+",
-        default=[0.03, 0.08, 0.15, 0.3, 0.5],
+        default=[600, 900, 1200, 1500, 1800],
         help="Lista de valores de rho (usado apenas no rho_exp)"
     )
 
@@ -79,14 +79,14 @@ def arguments():
         "--grid_step",
         type = float,
         default = 0.2,
-        help = "step of execution for lambda and alpha in range [0,1.0]"
+        help = "step of execution for alpha_feat and alpha_topo in range [0,1.0]"
     )
     
     parser.add_argument(
         "--seed",
         type = float,
         default = 2026,
-        help = "seed for reproduction. It is recommended to use a seed for the correct evaluation of lambda and alpha"
+        help = "seed for reproduction. It is recommended to use a seed for the correct evaluation of alpha_feat and alpha_topo"
     )
     # ======================
     # PARÂMETROS DO sfanalysis
@@ -345,7 +345,7 @@ def save_model(model, exp_dir: Path, exc: int, rho_value: float):
     torch.save(model.state_dict(), models_dir / fname)
 
 
-def append_result(df, out: dict, dt, exc: int, rho_value: float, ll: float, aa: float):
+def append_result(df, out: dict, dt, exc: int, rho_value: int, alpha_feat: float, alpha_topo: float):
     """
     Adiciona uma linha de resultados no DataFrame.
     """
@@ -355,12 +355,12 @@ def append_result(df, out: dict, dt, exc: int, rho_value: float, ll: float, aa: 
 
     row = {
         "execution": exc,
-        "rho": float(rho_value),
+        "rho": int(rho_value),
         "nmi": float(out["nmi"]),
         "num_nodes_generated": num_nodes,
         "num_edges_generated": num_edges,
-        "lambda" : ll,
-        "alpha" : aa
+        "alpha_feat": alpha_feat,
+        "alpha_topo": alpha_topo,
     }
 
     return pd.concat([df, pd.DataFrame([row])], ignore_index=True)

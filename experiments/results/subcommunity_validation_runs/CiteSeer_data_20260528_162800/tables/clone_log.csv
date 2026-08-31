@@ -1,0 +1,5 @@
+model,status,seconds,nodes,edges,path,error
+SCAtt,ok,2.7995972633361816,3327,4707,/home/gui-messias/Desktop/pip_synthetic_graphgen/synthetic_graphgen/experiments/results/subcommunity_validation_runs/CiteSeer_data_20260528_162800/clones/SCAtt.pt,
+GenCAT,ok,19.431785583496094,3327,4609,/home/gui-messias/Desktop/pip_synthetic_graphgen/synthetic_graphgen/experiments/results/subcommunity_validation_runs/CiteSeer_data_20260528_162800/clones/GenCAT.pt,
+Chung-Lu,ok,0.06761956214904785,3327,4552,/home/gui-messias/Desktop/pip_synthetic_graphgen/synthetic_graphgen/experiments/results/subcommunity_validation_runs/CiteSeer_data_20260528_162800/clones/Chung-Lu.pt,
+SkyMap,ok,868.9955213069916,8330,4563,/home/gui-messias/Desktop/pip_synthetic_graphgen/synthetic_graphgen/experiments/results/subcommunity_validation_runs/CiteSeer_data_20260528_162800/clones/SkyMap.pt,
