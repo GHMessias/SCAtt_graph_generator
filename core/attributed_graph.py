@@ -12,7 +12,7 @@ from torch_geometric.utils import from_networkit
 class AttributedGraph:
     """
     Representa um grafo com atributos padrão
-    dentro da biblioteca synthetic_graphgen
+    dentro da biblioteca SynCo_graph_generator
 
     Atributos principais
     ----------------------------
@@ -33,7 +33,8 @@ class AttributedGraph:
         graph: nk.Graph,
         x: torch.Tensor,
         y: Optional[torch.Tensor] = None,
-        edge_index: Optional[torch.Tensor] = None
+        edge_index: Optional[torch.Tensor] = None,
+        build_subgraphs: bool = True,
     ) -> None:
         self.graph = graph
         self.x = x
@@ -41,7 +42,7 @@ class AttributedGraph:
         self.edge_index = edge_index
         self._validate()
 
-        if self.y is not None:
+        if self.y is not None and build_subgraphs:
             self.create_subgraphs()
 
     # Métodos auxiliares

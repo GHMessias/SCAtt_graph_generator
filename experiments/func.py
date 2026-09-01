@@ -22,7 +22,7 @@ import torch  # <-- importante
 sys.path.append("../")
 
 from experiments.func import *   # arguments(), train_gae_kmeans_nmi, etc.
-from models.SCatt import SCAttGenerator
+from models.SynCo import SynCoGenerator
 
 def arguments():
     parser = argparse.ArgumentParser(prog="param_eval.py")
@@ -109,7 +109,7 @@ def arguments():
     parser.add_argument(
         "--clone_models",
         type = str,
-        default = ["GenCAT", "SCAtt", "chung-lu"],
+        default = ["GenCAT", "SynCo", "chung-lu"],
         nargs = "+"
     )
 

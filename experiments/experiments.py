@@ -2,7 +2,7 @@ import sys
 sys.path.append("../")
 
 from experiments.func import *   # arguments(), train_gae_kmeans_nmi, etc.
-from models.SCatt import SCAttGenerator
+from models.SynCo import SynCoGenerator
 from models.GenCAT import GenCATGenerator
 from models.SkyMap import SkyMapGenerator
 from models.chunglu import ChungLuGenerator
@@ -50,7 +50,7 @@ def main():
                     for ll in lambda_range:
 
                         # 3) gera o grafo com rho atual
-                        G = SCAttGenerator(seed = 2026).generate(
+                        G = SynCoGenerator(seed = 2026).generate(
                             n=args.n,
                             e=torch.tensor(args.num_edges),
                             y=args.y,
@@ -111,7 +111,8 @@ def main():
         models = {
             "GenCAT": GenCATGenerator(),
             "SkyMap": SkyMapGenerator(),
-            "SCAtt": SCAttGenerator(),
+            "SynCo": SynCoGenerator(),
+            "SCAtt": SynCoGenerator(),
             "chung-lu": ChungLuGenerator()
         }
 
@@ -208,7 +209,7 @@ def main():
 
         if args.dgcluster_test == "test1":
             for num_com in range(2, args.max_num_communities + 1):
-                path = "DGCluster_SCAtt_datasets/SCAtt_numcom_{len(y)}"
+                path = "DGCluster_SynCo_datasets/SynCo_numcom_{len(y)}"
                 y = torch.tensor([int(args.default_node_values / sum(list(range(1,num_com+1)))) * index for index in range(1,num_com+1)][::-1])
                 e = torch.tensor([val*4 if val >= 1000 else val*3 if 500 < val < 1000 else int(val*2.5) for val in y])
                 k= len(y)
@@ -218,12 +219,13 @@ def main():
 
                 A_out = torch.ones(size = (len(y), len(y))) - torch.eye(n = len(y))
 
-                path = f"experiments/DGCluster_SCAtt_datasets/SCAtt_numcom_{len(y)}.pt"
+                path = f"experiments/DGCluster_SynCo_datasets/SynCo_numcom_{len(y)}.pt"
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
 
                 if os.path.exists(path):
                     print(f"Skipping, graph alredy exists in {path}")
                 else:
-                    graph = SCAttGenerator().generate(n=y.sum().item(), y=y, k=k, e=e, A_in=A_in, dst=dst, rho=int(e.sum().item() * 1.2), A_out=A_out, S=S, alpha_powerlaw=1.3, d=256, alpha_topo=0.5, alpha_feat=0.3)
+                    graph = SynCoGenerator().generate(n=y.sum().item(), y=y, k=k, e=e, A_in=A_in, dst=dst, rho=int(e.sum().item() * 1.2), A_out=A_out, S=S, alpha_powerlaw=1.3, d=256, alpha_topo=0.5, alpha_feat=0.3)
                     dt = graph.to_data_pytorch()
                     torch.save(dt, path)
 

@@ -1,8 +1,8 @@
-# synthetic_graphgen
+# SynCo_graph_generator
 
-Implementacao experimental do **SCAtt (Synthetic Community-Aware Attributed Graph Generator)**, um gerador de grafos atribuidos voltado para benchmarking de Graph Neural Networks, clustering e deteccao de comunidades.
+Implementacao experimental do **SynCo (Synthetic Community Graph Generator)**, um gerador de grafos atribuidos voltado para benchmarking de Graph Neural Networks, clustering e deteccao de comunidades.
 
-O projeto acompanha o artigo em PDF presente neste diretorio: `SCAtt: Synthetic Community-Aware Attributed Graph Generator for Graph Neural Network Benchmarking`.
+O projeto acompanha o artigo em PDF presente neste diretorio: `SynCo: Synthetic Community Graph Generator for Graph Neural Network Benchmarking`.
 
 ## O que este codigo gera
 
@@ -19,10 +19,12 @@ onde:
 - `X`: matriz de atributos/features dos nos;
 - `Y`: rotulos/classes/comunidades dos nos.
 
-O gerador principal e o `SCAttGenerator`, definido em `models/SCatt.py`. Ele possui dois modos:
+O gerador principal e o `SynCoGenerator`, definido em `models/SynCo.py`. Ele possui dois modos:
 
 - `generate(...)`: cria um grafo sintetico a partir de parametros definidos pelo usuario.
 - `mimic(...)`: clona/mimetiza um grafo atribuido existente e, opcionalmente, aumenta seu numero de nos.
+
+Imports antigos via `models.SCatt.SCAttGenerator` continuam funcionando como alias de compatibilidade.
 
 ## Estrutura do repositorio
 
@@ -32,7 +34,7 @@ core/
   base_graph_generator.py    # Classe base dos geradores
 
 models/
-  SCatt.py                   # Implementacao principal do SCAtt
+  SynCo.py                   # Implementacao principal do SynCo
   GenCAT.py                  # Baseline de geracao/mimicagem
   SkyMap.py                  # Baseline de geracao/mimicagem
   chunglu.py                 # Baseline Chung-Lu para mimicagem
@@ -52,7 +54,7 @@ test/
   Notebooks e scripts exploratorios
 ```
 
-## Entradas do SCAtt
+## Entradas do SynCo
 
 No modo `generate`, os principais parametros sao:
 
@@ -101,7 +103,7 @@ A_in = [
 ]
 ```
 
-Na geracao de arestas homogeneas, o SCAtt agora usa:
+Na geracao de arestas homogeneas, o SynCo agora usa:
 
 1. `S[c]` para escolher a subcomunidade de origem;
 2. a linha `A_in[c][origem, :]` para escolher a subcomunidade de destino;
@@ -116,7 +118,7 @@ O numero de arestas heterogeneas e calculado por `rho - sum(e)`. Assim, `e` cont
 ```python
 import torch
 
-from models.SCatt import SCAttGenerator
+from models.SynCo import SynCoGenerator
 
 y = [40, 40, 40]
 e = [150, 200, 100]
@@ -147,7 +149,7 @@ A_out = torch.tensor([
     [0.5, 0.5, 0.0],
 ])
 
-graph = SCAttGenerator(seed=2026).generate(
+graph = SynCoGenerator(seed=2026).generate(
     n=sum(y),
     y=y,
     k=k,
@@ -166,21 +168,21 @@ print(graph)
 data = graph.to_data_pytorch()
 ```
 
-## Plotando um grafo SCAtt
+## Plotando um grafo SynCo
 
-Depois de gerar um `AttributedGraph`, use `graphPlotter.plot_scatt_graph`:
+Depois de gerar um `AttributedGraph`, use `graphPlotter.plot_synco_graph`:
 
 ```python
 from plot.plot import graphPlotter
 
 plotter = graphPlotter()
-fig, ax = plotter.plot_scatt_graph(
+fig, ax = plotter.plot_synco_graph(
     graph,
     layout="community",
     edge_layout="bundled",
     edge_alpha=0.08,
     community_distance=1.35,
-    save_path="scatt_graph.png",
+    save_path="synco_graph.png",
 )
 ```
 
@@ -190,7 +192,7 @@ Para plotar somente uma classe:
 fig, ax = plotter.plot_class(
     graph,
     class_id=1,
-    save_path="scatt_class_1.png",
+    save_path="synco_class_1.png",
 )
 ```
 
@@ -208,11 +210,11 @@ style = PublicationPlotStyle(
     edge_bundle_k=2000,
 )
 
-fig, ax = graphPlotter(style).plot_scatt_graph(
+fig, ax = graphPlotter(style).plot_synco_graph(
     graph,
     layout="community",
     edge_layout="bundled",
-    save_path="scatt_publication.png",
+    save_path="synco_publication.png",
 )
 ```
 
@@ -235,7 +237,7 @@ node_positions = plotter.get_node_positions(
 
 fig, axes = plt.subplots(1, 4, figsize=(14, 3.6), dpi=300)
 for ax, graph_i, title in zip(axes, graphs, titles):
-    plotter.plot_scatt_graph(
+    plotter.plot_synco_graph(
         graph_i,
         ax=ax,
         node_positions=node_positions,
@@ -244,7 +246,7 @@ for ax, graph_i, title in zip(axes, graphs, titles):
     )
 
 fig.tight_layout()
-fig.savefig("scatt_heterogeneous_control.png", bbox_inches="tight")
+fig.savefig("synco_heterogeneous_control.png", bbox_inches="tight")
 ```
 
 Tambem e possivel gerar e plotar em uma chamada:
@@ -252,7 +254,7 @@ Tambem e possivel gerar e plotar em uma chamada:
 ```python
 from plot.plot import graphPlotter
 
-graph, fig, ax = graphPlotter().generate_and_plot_scatt(
+graph, fig, ax = graphPlotter().generate_and_plot_synco(
     seed=2026,
     n=sum(y),
     y=y,
@@ -267,7 +269,7 @@ graph, fig, ax = graphPlotter().generate_and_plot_scatt(
     alpha_feat=0.3,
     alpha_topo=0.5,
     plot_kwargs={
-        "save_path": "scatt_graph.png",
+        "save_path": "synco_graph.png",
         "layout": "community",
         "edge_layout": "bundled",
     },
@@ -280,9 +282,9 @@ Para mimetizar um grafo existente, primeiro crie um `AttributedGraph`:
 
 ```python
 from core.attributed_graph import AttributedGraph
-from models.SCatt import SCAttGenerator
+from models.SynCo import SynCoGenerator
 
-mimicked = SCAttGenerator(seed=2026).mimic(
+mimicked = SynCoGenerator(seed=2026).mimic(
     base_graph=base_graph,
     num_nodes=None,  # ou um valor maior que base_graph.num_nodes()
 )
@@ -307,7 +309,7 @@ python experiments/experiments.py --experiment sfanalysis
 python experiments/experiments.py --experiment DGCluster
 ```
 
-O experimento `topology_rho` gera grafos SCAtt e avalia embeddings com GAE + KMeans usando NMI. O experimento `sfanalysis` compara mimicagem com GenCAT, SCAtt e Chung-Lu usando analise power-law/scale-free. O experimento `DGCluster` gera datasets sinteticos para avaliar o algoritmo DGCluster.
+O experimento `topology_rho` gera grafos SynCo e avalia embeddings com GAE + KMeans usando NMI. O experimento `sfanalysis` compara mimicagem com GenCAT, SynCo e Chung-Lu usando analise power-law/scale-free. O experimento `DGCluster` gera datasets sinteticos para avaliar o algoritmo DGCluster.
 
 ## Dependencias principais
 

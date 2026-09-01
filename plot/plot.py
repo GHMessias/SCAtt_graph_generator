@@ -536,7 +536,7 @@ class graphPlotter:
             bbox_to_anchor=(1.02, 1.02),
         )
 
-    def plot_scatt_graph(
+    def plot_synco_graph(
         self,
         graph: AttributedGraph,
         *,
@@ -555,13 +555,13 @@ class graphPlotter:
         dpi: Optional[int] = None,
     ):
         """
-        Plot a complete SCAtt graph or an induced subgraph for one class using netgraph.
+        Plot a complete SynCo graph or an induced subgraph for one class using netgraph.
 
         ``layout`` is kept as a short alias for ``node_layout``. The default full
         graph view uses netgraph's community node layout and bundled edge layout.
         """
         if not isinstance(graph, AttributedGraph):
-            raise TypeError("plot_scatt_graph espera um objeto AttributedGraph.")
+            raise TypeError("plot_synco_graph espera um objeto AttributedGraph.")
         if Graph is None:
             raise ImportError("O plot agora usa netgraph. Instale com `pip install netgraph`.") from _NETGRAPH_IMPORT_ERROR
 
@@ -631,17 +631,23 @@ class graphPlotter:
         return fig, ax
 
     def plot_class(self, graph: AttributedGraph, class_id: int, **kwargs):
-        return self.plot_scatt_graph(graph, class_id=class_id, **kwargs)
+        return self.plot_synco_graph(graph, class_id=class_id, **kwargs)
 
-    def generate_and_plot_scatt(
+    def plot_scatt_graph(self, graph: AttributedGraph, **kwargs):
+        return self.plot_synco_graph(graph, **kwargs)
+
+    def generate_and_plot_synco(
         self,
         *,
         seed: Optional[int] = None,
         plot_kwargs: Optional[Dict[str, Any]] = None,
         **generate_kwargs,
     ):
-        from models.SCatt import SCAttGenerator
+        from models.SynCo import SynCoGenerator
 
-        graph = SCAttGenerator(seed=seed).generate(**generate_kwargs)
-        fig, ax = self.plot_scatt_graph(graph, **(plot_kwargs or {}))
+        graph = SynCoGenerator(seed=seed).generate(**generate_kwargs)
+        fig, ax = self.plot_synco_graph(graph, **(plot_kwargs or {}))
         return graph, fig, ax
+
+    def generate_and_plot_scatt(self, **kwargs):
+        return self.generate_and_plot_synco(**kwargs)
