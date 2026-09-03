@@ -10,19 +10,13 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import normalized_mutual_info_score
 import numpy as np
 
-import os
-import sys
 import json
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-import torch  # <-- importante
 
-sys.path.append("../")
-
-from experiments.func import *   # arguments(), train_gae_kmeans_nmi, etc.
-from models.SynCo import SynCoGenerator
+from synco import SynCoGenerator
 
 def arguments():
     parser = argparse.ArgumentParser(prog="param_eval.py")

@@ -2,12 +2,11 @@ import sys
 sys.path.append("../")
 
 from experiments.func import *   # arguments(), train_gae_kmeans_nmi, etc.
-from models.SynCo import SynCoGenerator
+from synco import AttributedGraph, SynCoGenerator
 from models.GenCAT import GenCATGenerator
 from models.SkyMap import SkyMapGenerator
 from models.chunglu import ChungLuGenerator
 
-from core.attributed_graph import AttributedGraph
 
 from analysis.sfanalysis import PowerLawAnalysis
 

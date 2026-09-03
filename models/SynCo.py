@@ -976,6 +976,7 @@ class SynCoGenerator(BaseGenerator):
         mu_distribution=None,
         eps=1e-6,
         build_subgraphs: bool = True,
+        connect_isolated_nodes: bool = True,
     ):
         '''
 
@@ -1005,6 +1006,8 @@ class SynCoGenerator(BaseGenerator):
         :type alpha_topo: float
         :param build_subgraphs: if False, skips AttributedGraph subgraph construction for faster bulk generation.
         :type build_subgraphs: bool
+        :param connect_isolated_nodes: if False, skips the post-processing step that links isolated nodes.
+        :type connect_isolated_nodes: bool
         '''
 
         y, e, A_in, A_out, S, rho = self._validate_generate_inputs(
@@ -1076,13 +1079,14 @@ class SynCoGenerator(BaseGenerator):
                 error_context=f"arestas homogeneas na classe {label}",
             )
 
-        self._connect_isolated_nodes(tmp_graph, tmp_y, edge_set=edge_set)
-        if tmp_graph.numberOfEdges() > rho:
-            warnings.warn(
-                f"Ao conectar vertices isolados, o grafo passou a ter {tmp_graph.numberOfEdges()} arestas, "
-                f"mas rho={rho}. O grafo sera retornado com mais arestas que o valor solicitado.",
-                RuntimeWarning,
-            )
+        if connect_isolated_nodes:
+            self._connect_isolated_nodes(tmp_graph, tmp_y, edge_set=edge_set)
+            if tmp_graph.numberOfEdges() > rho:
+                warnings.warn(
+                    f"Ao conectar vertices isolados, o grafo passou a ter {tmp_graph.numberOfEdges()} arestas, "
+                    f"mas rho={rho}. O grafo sera retornado com mais arestas que o valor solicitado.",
+                    RuntimeWarning,
+                )
 
         missing_edges = max(0, rho - tmp_graph.numberOfEdges())
         target_hetero_edges = self._count_heterogeneous_edges(tmp_graph, tmp_y) + missing_edges
@@ -1135,6 +1139,7 @@ class SynCoGenerator(BaseGenerator):
         mu_distribution=None,
         eps=1e-6,
         build_subgraphs: bool = True,
+        connect_isolated_nodes: bool = True,
     ):
         return self._run_synco(
             n=n,
@@ -1154,6 +1159,7 @@ class SynCoGenerator(BaseGenerator):
             mu_distribution=mu_distribution,
             eps=eps,
             build_subgraphs=build_subgraphs,
+            connect_isolated_nodes=connect_isolated_nodes,
         )
     
 

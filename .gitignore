@@ -1,7 +1,13 @@
 test/
 DGCluster/
 datasets/
+examples/outputs/
+experiments/complexity/
+experiments/feature_space/
 experiments/results/topologic
 experiments/results/sfanalysis
+build/
+dist/
+*.egg-info/
 __pycache__/
 *.pyc

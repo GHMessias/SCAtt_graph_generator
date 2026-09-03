@@ -19,7 +19,7 @@ except ImportError as exc:
 else:
     _NETGRAPH_IMPORT_ERROR = None
 
-from core.attributed_graph import AttributedGraph
+from synco import AttributedGraph
 
 
 @dataclass
@@ -643,7 +643,7 @@ class graphPlotter:
         plot_kwargs: Optional[Dict[str, Any]] = None,
         **generate_kwargs,
     ):
-        from models.SynCo import SynCoGenerator
+        from synco import SynCoGenerator
 
         graph = SynCoGenerator(seed=seed).generate(**generate_kwargs)
         fig, ax = self.plot_synco_graph(graph, **(plot_kwargs or {}))

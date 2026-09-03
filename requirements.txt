@@ -1,0 +1,12 @@
+torch
+torch-geometric
+networkit
+numpy
+scipy
+scikit-learn
+pandas
+matplotlib
+networkx
+netgraph
+seaborn
+powerlaw

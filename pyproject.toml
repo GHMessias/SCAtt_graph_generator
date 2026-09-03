@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "synco-graph-generator"
+version = "0.1.0"
+description = "Synthetic community-aware attributed graph generator for graph learning benchmarks."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "torch-geometric",
+    "networkit",
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "pandas",
+    "matplotlib",
+    "networkx",
+    "netgraph",
+    "seaborn",
+    "powerlaw",
+]
+
+[tool.setuptools.packages.find]
+include = ["synco*", "core*", "models*", "analysis*", "plot*"]
